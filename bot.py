@@ -1,4 +1,5 @@
 import os
+import asyncio  # Key: need to manually handle event loop
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -26,20 +27,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 def main() -> None:
-    # Read Token from environment variables
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     
     if not token:
-        logger.error("CRITICAL: TELEGRAM_BOT_TOKEN is not set in Render Environment Variables!")
+        logger.error("CRITICAL: TELEGRAM_BOT_TOKEN is not set!")
         return
 
+    # ====== Key fix: manually create and set event loop (compatible with Python 3.14) ======
     try:
-        # Build the Application
+        asyncio.get_event_loop()
+    except RuntimeError:
+        # If no event loop exists in the current thread, create one and set it
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+    # =================================================================
+
+    try:
         application = Application.builder().token(token).build()
         application.add_handler(CommandHandler("start", start))
         
         logger.info("Bot is starting with long polling...")
-        # Run polling directly (no asyncio.run() wrapper needed)
         application.run_polling()
     except Exception as e:
         logger.error(f"Bot crashed: {e}", exc_info=True)
