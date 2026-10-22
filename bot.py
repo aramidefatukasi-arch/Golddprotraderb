@@ -29,8 +29,8 @@ def run_health_server():
 
 # --- 2. Your Messages & Data ---
 CHANNEL_LINK = "https://t.me/+CaYjuNbPEFA2NWU0"
+IMAGE_PATH = "welcome.jpg"
 
-# The initial image message
 WELCOME_TEXT = """🔥 Welcome to Lemvest Trading Lab!
 
 You're one step away from joining a community of 2,800+ members!
@@ -143,7 +143,6 @@ The channel is free to join. Your next step is one click away.
 👇 JOIN LEMVEST TRADING LAB TODAY!"""
 ]
 
-# File to store user data
 DB_FILE = "users.json"
 
 def load_users():
@@ -156,7 +155,7 @@ def save_users(users):
     with open(DB_FILE, "w") as f:
         json.dump(users, f)
 
-# --- 3. Background Task to Send Messages ---
+# --- 3. Background Task to Send Messages WITH IMAGE ---
 async def send_follow_ups(app):
     """Runs in the background, checking every minute if anyone needs a message."""
     while True:
@@ -172,23 +171,25 @@ async def send_follow_ups(app):
                         msg_text = FOLLOW_UP_MESSAGES[data["message_index"]]
                         
                         # Add the button to the message
-                        keyboard = [[InlineKeyboardButton("JOIN CHANNEL", url=CHANNEL_LINK)]]
+                        keyboard = [[InlineKeyboardButton("👉 JOIN CHANNEL 👈", url=CHANNEL_LINK)]]
                         reply_markup = InlineKeyboardMarkup(keyboard)
 
                         try:
-                            await app.bot.send_message(
-                                chat_id=int(user_id), 
-                                text=msg_text, 
-                                reply_markup=reply_markup,
-                                disable_web_page_preview=True
-                            )
+                            # Send the IMAGE with the caption
+                            with open(IMAGE_PATH, "rb") as photo:
+                                await app.bot.send_photo(
+                                    chat_id=int(user_id), 
+                                    photo=photo,
+                                    caption=msg_text, 
+                                    reply_markup=reply_markup
+                                )
+                            
                             # Advance to the next message and reset the 24h timer
                             users[user_id]["message_index"] += 1
                             users[user_id]["joined_at"] = current_time
                             updated = True
                         except Exception as e:
                             logger.error(f"Failed to send to {user_id}: {e}")
-                            # If user blocked the bot, remove them
                             if "blocked" in str(e).lower() or "chat not found" in str(e).lower():
                                 del users[user_id]
                                 updated = True
@@ -206,11 +207,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     users = load_users()
 
-    # If user is new, add them to the database
     if user_id not in users:
         users[user_id] = {
             "joined_at": time.time(),
-            "message_index": 0 # Start at message 1
+            "message_index": 0 
         }
         save_users(users)
         logger.info(f"New user added: {user_id}")
@@ -221,10 +221,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("👉 JOIN CHANNEL 👈", url=CHANNEL_LINK)]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    image_path = "welcome.jpg" 
 
     try:
-        with open(image_path, "rb") as photo:
+        with open(IMAGE_PATH, "rb") as photo:
             await update.message.reply_photo(
                 photo=photo,
                 caption=WELCOME_TEXT,
@@ -235,8 +234,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(text=WELCOME_TEXT, reply_markup=reply_markup)
 
 async def post_init(app):
-    """This runs automatically when the bot starts."""
-    # Start the background task
     app.create_task(send_follow_ups(app))
 
 def main() -> None:
@@ -256,7 +253,7 @@ def main() -> None:
     application = Application.builder().token(token).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start))
     
-    logger.info("Bot is starting with follow-up sequence...")
+    logger.info("Bot is starting with follow-up sequence and images...")
     application.run_polling()
 
 if __name__ == "__main__":
