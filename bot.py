@@ -166,9 +166,8 @@ async def send_follow_ups(app):
 
             for user_id, data in users.items():
                 
-                # ⚠️ THIS IS THE TIMER. 60 SECONDS FOR TESTING. 
-                # CHANGE BACK TO 86400 FOR 24 HOURS LATER.
-                if current_time - data["joined_at"] >= 60:
+                # ⚠️ THIS IS NOW SET TO 24 HOURS (86400 seconds)
+                if current_time - data["joined_at"] >= 86400:
                     
                     if data["message_index"] < len(FOLLOW_UP_MESSAGES):
                         msg_text = FOLLOW_UP_MESSAGES[data["message_index"]]
@@ -189,7 +188,7 @@ async def send_follow_ups(app):
                                 )
                             logger.info(f"Successfully sent message to {user_id}")
                             
-                            # Advance to the next message and reset the timer
+                            # Advance to the next message and reset the 24h timer
                             users[user_id]["message_index"] += 1
                             users[user_id]["joined_at"] = current_time
                             updated = True
@@ -205,7 +204,8 @@ async def send_follow_ups(app):
         except Exception as e:
             logger.error(f"Error in background task: {e}")
 
-        await asyncio.sleep(10) # Checks every 10 seconds for fast testing
+        # Checks the time every 60 seconds
+        await asyncio.sleep(60) 
 
 # --- 4. Bot Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -258,7 +258,7 @@ def main() -> None:
     application = Application.builder().token(token).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start))
     
-    logger.info("Bot is starting with follow-up sequence and images...")
+    logger.info("Bot is fully live. Next messages will send after 24 hours...")
     application.run_polling()
 
 if __name__ == "__main__":
