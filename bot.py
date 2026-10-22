@@ -166,8 +166,8 @@ async def send_follow_ups(app):
 
             for user_id, data in users.items():
                 
-                # ⚠️ THIS IS NOW SET TO 24 HOURS (86400 seconds)
-                if current_time - data["joined_at"] >= 86400:
+                # ⚠️ THIS IS NOW SET TO 6 HOURS (21,600 seconds)
+                if current_time - data["joined_at"] >= 21600:
                     
                     if data["message_index"] < len(FOLLOW_UP_MESSAGES):
                         msg_text = FOLLOW_UP_MESSAGES[data["message_index"]]
@@ -188,7 +188,7 @@ async def send_follow_ups(app):
                                 )
                             logger.info(f"Successfully sent message to {user_id}")
                             
-                            # Advance to the next message and reset the 24h timer
+                            # Advance to the next message and reset the 6h timer
                             users[user_id]["message_index"] += 1
                             users[user_id]["joined_at"] = current_time
                             updated = True
@@ -258,7 +258,7 @@ def main() -> None:
     application = Application.builder().token(token).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start))
     
-    logger.info("Bot is fully live. Next messages will send after 24 hours...")
+    logger.info("Bot is fully live. Next messages will send after 6 hours...")
     application.run_polling()
 
 if __name__ == "__main__":
