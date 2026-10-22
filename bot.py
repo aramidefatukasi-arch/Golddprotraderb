@@ -165,8 +165,11 @@ async def send_follow_ups(app):
             updated = False
 
             for user_id, data in users.items():
-                # 24 hours = 86400 seconds
-                if current_time - data["joined_at"] >= 86400:
+                
+                # ⚠️ THIS IS THE TIMER. 60 SECONDS FOR TESTING. 
+                # CHANGE BACK TO 86400 FOR 24 HOURS LATER.
+                if current_time - data["joined_at"] >= 60:
+                    
                     if data["message_index"] < len(FOLLOW_UP_MESSAGES):
                         msg_text = FOLLOW_UP_MESSAGES[data["message_index"]]
                         
@@ -176,6 +179,7 @@ async def send_follow_ups(app):
 
                         try:
                             # Send the IMAGE with the caption
+                            logger.info(f"Attempting to send message {data['message_index'] + 1} to user {user_id}")
                             with open(IMAGE_PATH, "rb") as photo:
                                 await app.bot.send_photo(
                                     chat_id=int(user_id), 
@@ -183,8 +187,9 @@ async def send_follow_ups(app):
                                     caption=msg_text, 
                                     reply_markup=reply_markup
                                 )
+                            logger.info(f"Successfully sent message to {user_id}")
                             
-                            # Advance to the next message and reset the 24h timer
+                            # Advance to the next message and reset the timer
                             users[user_id]["message_index"] += 1
                             users[user_id]["joined_at"] = current_time
                             updated = True
@@ -200,7 +205,7 @@ async def send_follow_ups(app):
         except Exception as e:
             logger.error(f"Error in background task: {e}")
 
-        await asyncio.sleep(60) # Wait 1 minute before checking again
+        await asyncio.sleep(10) # Checks every 10 seconds for fast testing
 
 # --- 4. Bot Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
