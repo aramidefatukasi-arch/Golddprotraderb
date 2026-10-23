@@ -166,19 +166,17 @@ async def send_follow_ups(app):
 
             for user_id, data in users.items():
                 
-                # ⚠️ THIS IS NOW SET TO 6 HOURS (21,600 seconds)
+                # ⚠️ 21,600 SECONDS = EXACTLY 6 HOURS
                 if current_time - data["joined_at"] >= 21600:
                     
                     if data["message_index"] < len(FOLLOW_UP_MESSAGES):
                         msg_text = FOLLOW_UP_MESSAGES[data["message_index"]]
                         
-                        # Add the button to the message
                         keyboard = [[InlineKeyboardButton("👉 JOIN CHANNEL 👈", url=CHANNEL_LINK)]]
                         reply_markup = InlineKeyboardMarkup(keyboard)
 
                         try:
-                            # Send the IMAGE with the caption
-                            logger.info(f"Attempting to send message {data['message_index'] + 1} to user {user_id}")
+                            logger.info(f"Sending 6-hour reminder {data['message_index'] + 1} to {user_id}")
                             with open(IMAGE_PATH, "rb") as photo:
                                 await app.bot.send_photo(
                                     chat_id=int(user_id), 
@@ -186,9 +184,8 @@ async def send_follow_ups(app):
                                     caption=msg_text, 
                                     reply_markup=reply_markup
                                 )
-                            logger.info(f"Successfully sent message to {user_id}")
                             
-                            # Advance to the next message and reset the 6h timer
+                            # Advance to the next message and RESET the timer for another 6 hours
                             users[user_id]["message_index"] += 1
                             users[user_id]["joined_at"] = current_time
                             updated = True
@@ -212,13 +209,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     users = load_users()
 
-    if user_id not in users:
-        users[user_id] = {
-            "joined_at": time.time(),
-            "message_index": 0 
-        }
-        save_users(users)
-        logger.info(f"New user added: {user_id}")
+    # If user is new, add them. If they exist, RESET their timer to 6 hours from now.
+    users[user_id] = {
+        "joined_at": time.time(), # Time right now
+        "message_index": 0        # Start from message 1
+    }
+    save_users(users)
+    logger.info(f"User {user_id} started the bot. Timer reset to 6 hours.")
 
     keyboard = [
         [InlineKeyboardButton("👉 JOIN CHANNEL 👈", url=CHANNEL_LINK)],
@@ -258,7 +255,7 @@ def main() -> None:
     application = Application.builder().token(token).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start))
     
-    logger.info("Bot is fully live. Next messages will send after 6 hours...")
+    logger.info("Bot is live. Reminders will be sent every 6 hours.")
     application.run_polling()
 
 if __name__ == "__main__":
