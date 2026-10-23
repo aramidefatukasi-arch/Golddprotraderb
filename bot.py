@@ -46,9 +46,8 @@ Everything built around 9 years of real trading experience.
 
 👇 Join our Telegram channel and see for yourself!"""
 
-# The 8 follow-up messages
-FOLLOW_UP_MESSAGES = [
-    """1 📊 Welcome to Lemvest Trading Lab!
+# The bot will repeat this specific message every 6 hours
+MESSAGE_1 = """1 📊 Welcome to Lemvest Trading Lab!
 
 9 years of trading experience. 2,800+ community members. Real market insights, every day.
 
@@ -60,88 +59,7 @@ Ready to take your trading knowledge further?
 
 👇 Tap START to discover what's inside!
 
-        😬 DISCOVER LEMVEST""",
-    """2 📊 The markets move every day. Are you keeping up?
-
-Bitcoin, Gold, and major indices. Every trading day brings new opportunities and risks.
-
-Our Daily Market Briefings break down market movements, key price levels, and potential scenarios.
-
-Less noise. More clarity.
-
-👇 Get your daily market insights for free!""",
-    """3 🔥 9 YEARS IN THE MARKETS. NOW SHARING THE EXPERIENCE.
-
-After 9 years of trading, one thing is clear: experience makes a difference.
-
-At Lemvest, we share our market approach, analysis, and trading process with a growing community of 2,800+ members.
-
-No unnecessary hype. Just real market insights.
-
-👇 Come see how we approach the markets!""",
-    """4 🎯 EVER WONDERED WHAT GOES INTO A TRADING SETUP?
-
-It's not just about clicking BUY or SELL.
-
-Every setup involves:
-
-📊 Market Structure & Key Levels
-🎯 Entry & Exit Planning
-🛑 Risk Management
-
-We share real trading setups and explain the reasoning behind them.
-
-👇 See how we analyze trading opportunities!""",
-    """5 🔴 WHAT IF YOU COULD WATCH TRADING DECISIONS HAPPEN LIVE?
-
-Charts. Market movements. Real-time analysis.
-
-Our live trading sessions let you follow experienced traders as they analyze opportunities and manage risk in real market conditions.
-
-No hindsight. Just the markets unfolding in real time.
-
-👇 Don't miss our next live session!""",
-    """6 🔖 TRADING IS A SKILL. ARE YOU BUILDING YOURS?
-
-Whether you're a complete beginner or already trading, there's always something new to learn.
-
-Inside Lemvest, you'll discover:
-
-🎓 Trading Strategies & Market Concepts
-🧠 Trading Psychology
-🛑 Risk Management Principles
-
-Learn at your own pace and build a more structured approach.
-
-👇 Start learning with Lemvest!""",
-    """7 🧮 DO YOU KNOW YOUR RISK BEFORE ENTERING A TRADE?
-
-A good trading plan starts with the numbers.
-
-Position sizing. Risk-to-reward ratios. Potential outcomes.
-
-Our practical trading tools help you understand the calculations behind better-informed trading decisions.
-
-Because managing risk matters just as much as finding opportunities.
-
-👇 Discover the Lemvest Trader Toolkit!""",
-    """8 👀 STILL WATCHING FROM THE SIDELINES?
-
-2,800+ members have already joined Lemvest Trading Lab.
-
-Here's what you're missing:
-
-📊 Daily Market Briefings
-🔴 Live Trading Sessions
-🎯 Real Market Analysis & Trading Setups
-📚 Trading Education & Practical Tools
-
-9 years of trading experience, shared with our community.
-
-The channel is free to join. Your next step is one click away.
-
-👇 JOIN LEMVEST TRADING LAB TODAY!"""
-]
+        😬 DISCOVER LEMVEST"""
 
 DB_FILE = "users.json"
 
@@ -166,29 +84,30 @@ async def send_follow_ups(app):
 
             for user_id, data in users.items():
                 
-                # ⚠️ 21,600 SECONDS = EXACTLY 6 HOURS
+                # Check if 6 hours (21,600 seconds) have passed
                 if current_time - data["joined_at"] >= 21600:
                     
-                    if data["message_index"] < len(FOLLOW_UP_MESSAGES):
-                        msg_text = FOLLOW_UP_MESSAGES[data["message_index"]]
+                    # Check if we have sent less than 60 messages (60 messages = 15 days)
+                    if data["message_index"] < 60:
                         
                         keyboard = [[InlineKeyboardButton("👉 JOIN CHANNEL 👈", url=CHANNEL_LINK)]]
                         reply_markup = InlineKeyboardMarkup(keyboard)
 
                         try:
-                            logger.info(f"Sending 6-hour reminder {data['message_index'] + 1} to {user_id}")
+                            logger.info(f"Sending 6-hour reminder #{data['message_index'] + 1} to {user_id}")
                             with open(IMAGE_PATH, "rb") as photo:
                                 await app.bot.send_photo(
                                     chat_id=int(user_id), 
                                     photo=photo,
-                                    caption=msg_text, 
+                                    caption=MESSAGE_1, # ALWAYS SEND MESSAGE 1
                                     reply_markup=reply_markup
                                 )
                             
-                            # Advance to the next message and RESET the timer for another 6 hours
+                            # Increase the counter and reset the 6h timer
                             users[user_id]["message_index"] += 1
                             users[user_id]["joined_at"] = current_time
                             updated = True
+                            
                         except Exception as e:
                             logger.error(f"Failed to send to {user_id}: {e}")
                             if "blocked" in str(e).lower() or "chat not found" in str(e).lower():
@@ -212,10 +131,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # If user is new, add them. If they exist, RESET their timer to 6 hours from now.
     users[user_id] = {
         "joined_at": time.time(), # Time right now
-        "message_index": 0        # Start from message 1
+        "message_index": 0        # Start the 15-day countdown from 0
     }
     save_users(users)
-    logger.info(f"User {user_id} started the bot. Timer reset to 6 hours.")
+    logger.info(f"User {user_id} started the bot. 15-day timer started.")
 
     keyboard = [
         [InlineKeyboardButton("👉 JOIN CHANNEL 👈", url=CHANNEL_LINK)],
@@ -255,7 +174,7 @@ def main() -> None:
     application = Application.builder().token(token).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start))
     
-    logger.info("Bot is live. Reminders will be sent every 6 hours.")
+    logger.info("Bot is live. Reminder 1 will be sent every 6 hours for 15 days.")
     application.run_polling()
 
 if __name__ == "__main__":
