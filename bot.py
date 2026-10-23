@@ -1,53 +1,28 @@
 import os
 import asyncio
 import logging
-import json
-import time
-from threading import Thread
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import sqlite3
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# ==========================================
+# 1. SETUP AND CONFIGURATION
+# ==========================================
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- 1. Web Server for Render/UptimeRobot ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
-
-    def log_message(self, format, *args):
-        pass
-
-def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
-
-# --- 2. Your Messages & Data ---
 CHANNEL_LINK = "https://t.me/+CaYjuNbPEFA2NWU0"
-IMAGE_PATH = "welcome.jpg"
 
-WELCOME_TEXT = """🔥 Welcome to Lemvest Trading Lab!
+WELCOME_TEXT = """Welcome to Lemvest Trading Lab!  
 
-You're one step away from joining a community of 2,800+ members!
+Here, I share trading insights, market analysis, educational content, and real trading experience to help you better understand the market.
 
-Here's what you'll find inside:
+We're just getting started, so you're early!
 
-📊 Daily Market Briefings
-📈 Live Trading Sessions
-🎯 Real Trading Setups & Market Analysis
-📚 Educational Resources & Trading Tools
+Join for free and grow with us."""
 
-Everything built around 9 years of real trading experience.
-
-👇 Join our Telegram channel and see for yourself!"""
-
-# The bot will repeat this specific message every 6 hours
-MESSAGE_1 = """1 📊 Welcome to Lemvest Trading Lab!
+PROMO_TEXT = """📊 Welcome to Lemvest Trading Lab!
 
 9 years of trading experience. 2,800+ community members. Real market insights, every day.
 
@@ -57,124 +32,121 @@ MESSAGE_1 = """1 📊 Welcome to Lemvest Trading Lab!
 
 Ready to take your trading knowledge further?
 
-👇 Tap START to discover what's inside!
+👇 Tap the button below to discover what's inside!"""
 
-        😬 DISCOVER LEMVEST"""
+# ==========================================
+# 2. DATABASE (To track 6-hour limits)
+# ==========================================
+DB_FILE = "users.db"
 
-DB_FILE = "users.json"
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (user_id INTEGER PRIMARY KEY, last_message_time TEXT)''')
+    conn.commit()
+    conn.close()
 
-def load_users():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    return {}
+def update_user_time(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute("INSERT OR REPLACE INTO users (user_id, last_message_time) VALUES (?, ?)", (user_id, now))
+    conn.commit()
+    conn.close()
 
-def save_users(users):
-    with open(DB_FILE, "w") as f:
-        json.dump(users, f)
+def get_users_for_broadcast():
+    """Finds users who haven't received a message in the last 6 hours."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    six_hours_ago = (datetime.now() - timedelta(hours=6)).isoformat()
+    
+    # Select users whose last message was more than 6 hours ago
+    c.execute("SELECT user_id FROM users WHERE last_message_time < ?", (six_hours_ago,))
+    users = [row[0] for row in c.fetchall()]
+    conn.close()
+    return users
 
-# --- 3. Background Task to Send Messages WITH IMAGE ---
-async def send_follow_ups(app):
-    """Runs in the background, checking every minute if anyone needs a message."""
-    while True:
-        try:
-            users = load_users()
-            current_time = time.time()
-            updated = False
-
-            for user_id, data in users.items():
-                
-                # Check if 6 hours (21,600 seconds) have passed
-                if current_time - data["joined_at"] >= 21600:
-                    
-                    # Check if we have sent less than 60 messages (60 messages = 15 days)
-                    if data["message_index"] < 60:
-                        
-                        keyboard = [[InlineKeyboardButton("👉 JOIN CHANNEL 👈", url=CHANNEL_LINK)]]
-                        reply_markup = InlineKeyboardMarkup(keyboard)
-
-                        try:
-                            logger.info(f"Sending 6-hour reminder #{data['message_index'] + 1} to {user_id}")
-                            with open(IMAGE_PATH, "rb") as photo:
-                                await app.bot.send_photo(
-                                    chat_id=int(user_id), 
-                                    photo=photo,
-                                    caption=MESSAGE_1, # ALWAYS SEND MESSAGE 1
-                                    reply_markup=reply_markup
-                                )
-                            
-                            # Increase the counter and reset the 6h timer
-                            users[user_id]["message_index"] += 1
-                            users[user_id]["joined_at"] = current_time
-                            updated = True
-                            
-                        except Exception as e:
-                            logger.error(f"Failed to send to {user_id}: {e}")
-                            if "blocked" in str(e).lower() or "chat not found" in str(e).lower():
-                                del users[user_id]
-                                updated = True
-
-            if updated:
-                save_users(users)
-
-        except Exception as e:
-            logger.error(f"Error in background task: {e}")
-
-        # Checks the time every 60 seconds
-        await asyncio.sleep(60) 
-
-# --- 4. Bot Commands ---
+# ==========================================
+# 3. BOT COMMANDS
+# ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.effective_user.id)
-    users = load_users()
+    user_id = update.effective_user.id
+    
+    # Anti-spam: Record the time they clicked start
+    update_user_time(user_id)
 
-    # If user is new, add them. If they exist, RESET their timer to 6 hours from now.
-    users[user_id] = {
-        "joined_at": time.time(), # Time right now
-        "message_index": 0        # Start the 15-day countdown from 0
-    }
-    save_users(users)
-    logger.info(f"User {user_id} started the bot. 15-day timer started.")
-
-    keyboard = [
-        [InlineKeyboardButton("👉 JOIN CHANNEL 👈", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("🚀 JOIN CHANNEL 🚀", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("👉 JOIN CHANNEL 👈", url=CHANNEL_LINK)]
-    ]
+    keyboard = [[InlineKeyboardButton("Join Our Channel", url=CHANNEL_LINK)]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    try:
-        with open(IMAGE_PATH, "rb") as photo:
-            await update.message.reply_photo(
-                photo=photo,
-                caption=WELCOME_TEXT,
-                reply_markup=reply_markup
-            )
-    except Exception as e:
-        logger.error(f"Image error: {e}")
-        await update.message.reply_text(text=WELCOME_TEXT, reply_markup=reply_markup)
+    await update.message.reply_text(
+        text=WELCOME_TEXT,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
 
-async def post_init(app):
-    app.create_task(send_follow_ups(app))
-
-def main() -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        logger.error("CRITICAL: TELEGRAM_BOT_TOKEN is not set!")
+# ==========================================
+# 4. THE 6-HOUR BACKGROUND TASK
+# ==========================================
+async def broadcast_task(context: ContextTypes.DEFAULT_TYPE):
+    """Runs every minute to check if anyone needs the 6-hour message."""
+    users_to_message = get_users_for_broadcast()
+    
+    if not users_to_message:
         return
 
-    Thread(target=run_health_server, daemon=True).start()
+    keyboard = [[InlineKeyboardButton("Discover Lemvest", url=CHANNEL_LINK)]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
+    for user_id in users_to_message:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=PROMO_TEXT,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+            # Update their time so they don't get spammed again for another 6 hours
+            update_user_time(user_id)
+            logger.info(f"Sent 6-hour promo to user {user_id}")
+            
+            # Sleep for 1 second between messages to avoid hitting Telegram's rate limits
+            await asyncio.sleep(1) 
+        except Exception as e:
+            logger.error(f"Failed to send promo to {user_id}: {e}")
+
+# ==========================================
+# 5. MAIN EXECUTION
+# ==========================================
+def main() -> None:
+    # Initialize the database
+    init_db()
+
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logger.error("CRITICAL: TELEGRAM_BOT_TOKEN is not set in Render Environment Variables!")
+        return
+
+    # FIX FOR PYTHON 3.14 CRASH
     try:
         asyncio.get_event_loop()
     except RuntimeError:
         new_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(new_loop)
 
-    application = Application.builder().token(token).post_init(post_init).build()
-    application.add_handler(CommandHandler("start", start))
+    # Build the application
+    application = Application.builder().token(token).build()
     
-    logger.info("Bot is live. Reminder 1 will be sent every 6 hours for 15 days.")
+    # Add /start command
+    application.add_handler(CommandHandler("start", start))
+
+    # Start the background task (checks every 60 seconds)
+    if application.job_queue:
+        application.job_queue.run_repeating(broadcast_task, interval=60, first=10)
+    else:
+        logger.warning("JobQueue not available. Check requirements.txt!")
+
+    logger.info("Bot is starting with long polling...")
     application.run_polling()
 
 if __name__ == "__main__":
