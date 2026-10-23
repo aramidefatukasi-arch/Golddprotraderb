@@ -3,12 +3,13 @@ import time
 import asyncio
 import logging
 import sqlite3
+
 from pathlib import Path
 from contextlib import closing, suppress
 from datetime import timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Forbidden, RetryAfter
+from telegram.error import Forbidden, RetryAfter, BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 
@@ -21,9 +22,23 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Avoid logging request URLs containing the bot token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+BASE_DIR = Path(__file__).resolve().parent
+WELCOME_IMAGE = BASE_DIR / "welcome.jpg"
+
+DB_FILE = os.path.expanduser(
+    os.environ.get("DB_FILE", str(BASE_DIR / "users.db"))
+)
+
 CHANNEL_LINK = "https://t.me/+CaYjuNbPEFA2NWU0"
+
+REMINDER_INTERVAL = 6 * 60 * 60
+CAMPAIGN_DURATION = 15 * 24 * 60 * 60
+CHECK_INTERVAL = 60
+BATCH_SIZE = 100
 
 WELCOME_TEXT = """Welcome to Lemvest Trading Lab!
 
@@ -46,14 +61,6 @@ Ready to take your trading knowledge further?
 👇 Tap the button below to discover what's inside!
 
 Send /stop to stop reminders."""
-
-DB_FILE = os.path.expanduser(
-    os.environ.get("DB_FILE", "users.db")
-)
-
-SIX_HOURS = 6 * 60 * 60
-FIFTEEN_DAYS = 15 * 24 * 60 * 60
-CHECK_INTERVAL = 60
 
 
 # ==========================================
@@ -88,25 +95,34 @@ def init_db():
             ON reminder_schedule (active, next_send_at)
         """)
 
-        # Import users from your original reminder database,
-        # if that table exists. Existing schedules are preserved.
         old_table = conn.execute("""
-            SELECT name FROM sqlite_master
+            SELECT name
+            FROM sqlite_master
             WHERE type = 'table' AND name = 'users'
         """).fetchone()
 
         if old_table:
+            # Import original users only once.
+            # Original signup dates were not stored, so imported
+            # users begin a 15-day period at migration.
+            # Existing reminder schedules remain unchanged.
             conn.execute("""
                 INSERT OR IGNORE INTO reminder_schedule (
-                    user_id, started_at, expires_at,
-                    next_send_at, active
+                    user_id,
+                    started_at,
+                    expires_at,
+                    next_send_at,
+                    active
                 )
-                SELECT user_id, ?, ?, ?, 1 FROM users
+                SELECT user_id, ?, ?, ?, 1
+                FROM users
             """, (
                 now,
-                now + FIFTEEN_DAYS,
-                now + SIX_HOURS,
+                now + CAMPAIGN_DURATION,
+                now + REMINDER_INTERVAL,
             ))
+
+    logger.info("Reminder database initialized: %s", DB_FILE)
 
 
 def register_user(user_id):
@@ -115,24 +131,30 @@ def register_user(user_id):
     with closing(connect_db()) as conn, conn:
         conn.execute("""
             INSERT OR IGNORE INTO reminder_schedule (
-                user_id, started_at, expires_at,
-                next_send_at, active
+                user_id,
+                started_at,
+                expires_at,
+                next_send_at,
+                active
             )
             VALUES (?, ?, ?, ?, 1)
         """, (
             user_id,
             now,
-            now + FIFTEEN_DAYS,
-            now + SIX_HOURS,
+            now + CAMPAIGN_DURATION,
+            now + REMINDER_INTERVAL,
         ))
 
-        # /start postpones the next reminder, but does not
-        # extend the campaign or reactivate stopped reminders.
+        # Repeated /start postpones the next reminder.
+        # It does not extend expiry or reactivate stopped users.
         conn.execute("""
             UPDATE reminder_schedule
             SET next_send_at = MAX(next_send_at, ?)
             WHERE user_id = ?
-        """, (now + SIX_HOURS, user_id))
+        """, (
+            now + REMINDER_INTERVAL,
+            user_id,
+        ))
 
 
 def get_due_users():
@@ -146,14 +168,18 @@ def get_due_users():
               AND next_send_at <= ?
               AND expires_at > ?
             ORDER BY next_send_at
-            LIMIT 100
-        """, (now, now)).fetchall()
+            LIMIT ?
+        """, (
+            now,
+            now,
+            BATCH_SIZE,
+        )).fetchall()
 
     return [row[0] for row in rows]
 
 
 def claim_reminder(user_id):
-    # Reserve before sending to prevent immediate duplicates.
+    """Reserve the next six hours BEFORE attempting delivery."""
     now = time.time()
 
     with closing(connect_db()) as conn, conn:
@@ -165,7 +191,7 @@ def claim_reminder(user_id):
               AND next_send_at <= ?
               AND expires_at > ?
         """, (
-            now + SIX_HOURS,
+            now + REMINDER_INTERVAL,
             user_id,
             now,
             now,
@@ -175,16 +201,39 @@ def claim_reminder(user_id):
 
 
 def record_delivery(user_id):
+    """Keep the next reminder six hours after delivery."""
     with closing(connect_db()) as conn, conn:
         conn.execute("""
             UPDATE reminder_schedule
             SET next_send_at = MAX(next_send_at, ?)
             WHERE user_id = ?
-        """, (time.time() + SIX_HOURS, user_id))
+        """, (
+            time.time() + REMINDER_INTERVAL,
+            user_id,
+        ))
 
 
 def disable_reminders(user_id):
+    now = time.time()
+
     with closing(connect_db()) as conn, conn:
+        # Also record /stop for users without an existing schedule.
+        conn.execute("""
+            INSERT OR IGNORE INTO reminder_schedule (
+                user_id,
+                started_at,
+                expires_at,
+                next_send_at,
+                active
+            )
+            VALUES (?, ?, ?, ?, 0)
+        """, (
+            user_id,
+            now,
+            now + CAMPAIGN_DURATION,
+            now + REMINDER_INTERVAL,
+        ))
+
         conn.execute("""
             UPDATE reminder_schedule
             SET active = 0
@@ -193,7 +242,51 @@ def disable_reminders(user_id):
 
 
 # ==========================================
-# 3. COMMANDS
+# 3. WELCOME MESSAGE
+# ==========================================
+
+async def send_welcome(message):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "Join Our Channel",
+                url=CHANNEL_LINK,
+            )
+        ]
+    ])
+
+    # Send the image, text and button together.
+    if WELCOME_IMAGE.is_file():
+        try:
+            with WELCOME_IMAGE.open("rb") as photo:
+                await message.reply_photo(
+                    photo=photo,
+                    caption=WELCOME_TEXT,
+                    reply_markup=keyboard,
+                )
+            return
+
+        except (OSError, BadRequest):
+            # A missing/unreadable/rejected image falls back to text.
+            logger.exception(
+                "Welcome image could not be sent; using text."
+            )
+
+    else:
+        logger.warning(
+            "Welcome image not found: %s",
+            WELCOME_IMAGE,
+        )
+
+    await message.reply_text(
+        text=WELCOME_TEXT,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+# ==========================================
+# 4. COMMANDS
 # ==========================================
 
 async def start(
@@ -202,29 +295,19 @@ async def start(
 ) -> None:
     message = update.effective_message
     user = update.effective_user
+    chat = update.effective_chat
 
-    if message is None or user is None:
+    if message is None or user is None or chat is None:
         return
 
-    keyboard = [[
-        InlineKeyboardButton(
-            "Join Our Channel",
-            url=CHANNEL_LINK,
-        )
-    ]]
+    # Welcome comes first, independently of the reminder database.
+    await send_welcome(message)
 
-    # Your original welcome is sent FIRST.
-    await message.reply_text(
-        text=WELCOME_TEXT,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        disable_web_page_preview=True,
-    )
-
-    # Only private chats receive scheduled reminders.
-    if update.effective_chat.type == "private":
+    if chat.type == "private":
         try:
             await asyncio.to_thread(register_user, user.id)
-            logger.info("Registered /start for user %s", user.id)
+            logger.info("/start handled for user %s", user.id)
+
         except Exception:
             logger.exception(
                 "Welcome sent, but reminder registration failed "
@@ -245,8 +328,10 @@ async def stop(
             disable_reminders,
             update.effective_user.id,
         )
+
     except Exception:
-        logger.exception("Could not save /stop")
+        logger.exception("Failed to save /stop")
+
         await update.effective_message.reply_text(
             "I couldn't save your request. Please try /stop again."
         )
@@ -257,20 +342,39 @@ async def stop(
     )
 
 
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not update.effective_message:
+        return
+
+    await update.effective_message.reply_text(
+        "/start — Show the welcome image and channel link\n"
+        "/stop — Stop reminders\n"
+        "/help — Show this help\n\n"
+        "Reminders start six hours after registration and are "
+        "scheduled six hours apart for a 15-day period.\n\n"
+        "Sending /start again does not extend the period "
+        "or restart stopped reminders."
+    )
+
+
 # ==========================================
-# 4. BACKGROUND REMINDERS
+# 5. REMINDER LOOP
 # ==========================================
 
 async def reminder_loop(application):
-    # Allow polling to start before checking reminders.
     await asyncio.sleep(10)
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "Discover Lemvest",
-            url=CHANNEL_LINK,
-        )
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "Discover Lemvest",
+                url=CHANNEL_LINK,
+            )
+        ]
+    ])
 
     pause_until = 0.0
 
@@ -311,8 +415,9 @@ async def reminder_loop(application):
                             disable_reminders,
                             user_id,
                         )
+
                         logger.info(
-                            "Blocked user %s disabled",
+                            "Reminders disabled for blocked user %s",
                             user_id,
                         )
 
@@ -322,42 +427,53 @@ async def reminder_loop(application):
                         if isinstance(delay, timedelta):
                             delay = delay.total_seconds()
 
-                        pause_until = time.time() + float(delay) + 1
+                        pause_until = (
+                            time.time() + float(delay) + 1
+                        )
 
                         logger.warning(
-                            "Telegram rate limit: paused for %s seconds",
+                            "Telegram rate limit: pausing reminders "
+                            "for %s seconds",
                             delay,
                         )
                         break
 
                     except Exception:
-                        # Keep the reservation even if delivery is
-                        # uncertain. Do not retry every minute.
+                        # Keep the six-hour reservation even after
+                        # errors. A timeout may mean Telegram already
+                        # delivered the message.
                         logger.exception(
                             "Reminder failed for user %s; "
-                            "next attempt delayed six hours",
+                            "six-hour reservation retained",
                             user_id,
                         )
 
-                    # Pace messages to different users.
+                    # One second BETWEEN DIFFERENT USERS.
+                    # The database enforces each user's six-hour gap.
                     await asyncio.sleep(1)
 
         except asyncio.CancelledError:
             raise
+
         except Exception:
             logger.exception("Reminder cycle failed")
 
         await asyncio.sleep(CHECK_INTERVAL)
 
 
+# ==========================================
+# 6. STARTUP AND SHUTDOWN
+# ==========================================
+
 async def post_init(application):
     try:
         await asyncio.to_thread(init_db)
+
     except Exception:
-        # A database failure should not stop welcome replies.
         logger.exception(
-            "Reminder database unavailable. "
-            "Welcome replies remain enabled."
+            "Reminder database failed to initialize. "
+            "Welcome replies remain available. "
+            "Fix the database path and restart to enable reminders."
         )
         return
 
@@ -365,7 +481,8 @@ async def post_init(application):
         reminder_loop(application),
         name="lemvest_reminders",
     )
-    logger.info("Reminder background task started")
+
+    logger.info("Background reminder task started")
 
 
 async def stop_background_task(application):
@@ -373,52 +490,59 @@ async def stop_background_task(application):
 
     if task is not None:
         task.cancel()
+
         with suppress(asyncio.CancelledError):
             await task
 
 
 async def error_handler(update, context):
     error = context.error
+
     logger.error(
-        "Bot error",
-        exc_info=(type(error), error, error.__traceback__),
+        "Unhandled bot error",
+        exc_info=(
+            type(error),
+            error,
+            error.__traceback__,
+        ),
     )
 
 
 # ==========================================
-# 5. MAIN
+# 7. MAIN
 # ==========================================
 
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
 
     if not token:
-        logger.error("CRITICAL: TELEGRAM_BOT_TOKEN is not set!")
-        return
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not set in environment variables."
+        )
 
-    # Explicit event loop for Python 3.14 compatibility.
+    # Explicit event loop for environments without a default loop.
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    try:
-        application = (
-            Application.builder()
-            .token(token)
-            .post_init(post_init)
-            .post_stop(stop_background_task)
-            .post_shutdown(stop_background_task)
-            .build()
-        )
+    application = (
+        Application.builder()
+        .token(token)
+        # Reminders use asyncio; no JobQueue is needed.
+        .job_queue(None)
+        .post_init(post_init)
+        .post_stop(stop_background_task)
+        .post_shutdown(stop_background_task)
+        .build()
+    )
 
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("stop", stop))
-        application.add_error_handler(error_handler)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stop", stop))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_error_handler(error_handler)
 
-        logger.info("Bot is starting with long polling...")
-        application.run_polling()
+    logger.info("Bot is starting with long polling...")
 
-    except Exception:
-        logger.exception("Bot crashed")
+    application.run_polling()
 
 
 if __name__ == "__main__":
