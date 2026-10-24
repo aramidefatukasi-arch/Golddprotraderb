@@ -5,8 +5,8 @@ import os
 import sqlite3
 import time
 from contextlib import closing, suppress
-from pathlib import Path
 from datetime import timedelta
+from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import (
@@ -16,11 +16,7 @@ from telegram.error import (
     RetryAfter,
     TelegramError,
 )
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ============================================================
 # CONFIGURATION
@@ -41,16 +37,15 @@ CHANNEL_LINK = os.getenv(
     "CHANNEL_LINK",
     "https://t.me/+CaYjuNbPEFA2NWU0",
 ).strip()
+DB_FILE = os.getenv("DB_FILE", str(BASE_DIR / "users.db")).strip()
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 
-# On Render, use a persistent disk path for DB_FILE.
-DB_FILE = os.getenv("DB_FILE", str(BASE_DIR / "users.db"))
-
-REMINDER_INTERVAL = 6 * 60 * 60       # Six hours
-CAMPAIGN_DURATION = 15 * 24 * 60 * 60 # Fifteen days
-CHECK_INTERVAL = 30                   # Check for due reminders
+REMINDER_INTERVAL = 6 * 60 * 60
+CAMPAIGN_DURATION = 15 * 24 * 60 * 60
+CHECK_INTERVAL = 30
 BATCH_SIZE = 50
 SEND_DELAY = 1
-RETRY_DELAY = 15 * 60                 # Retry temporary failures in 15 minutes
+RETRY_DELAY = 15 * 60
 
 WELCOME_TEXT = """Welcome to Lemvest Trading Lab!
 
@@ -111,7 +106,6 @@ def init_db():
             )
         }
 
-        # Migration support for the previous database version.
         if "last_sent_at" not in columns:
             conn.execute(
                 "ALTER TABLE reminder_schedule "
@@ -122,14 +116,13 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_reminder_due
             ON reminder_schedule(active, next_send_at, expires_at)
         """)
-
         conn.commit()
 
     logger.info("Database initialized: %s", DB_FILE)
 
 
 def activate_reminders(user_id: int) -> str:
-    """Start a campaign, without resetting an active campaign."""
+    """Activate a campaign without resetting an active campaign."""
     now = time.time()
 
     with closing(connect_db()) as conn:
@@ -141,7 +134,6 @@ def activate_reminders(user_id: int) -> str:
             WHERE user_id = ?
         """, (user_id,)).fetchone()
 
-        # Repeated /start commands must not restart the campaign timer.
         if row and row[0] == 1 and row[1] > now:
             conn.commit()
             return "already_active"
@@ -164,14 +156,13 @@ def activate_reminders(user_id: int) -> str:
             now + CAMPAIGN_DURATION,
             now + REMINDER_INTERVAL,
         ))
-
         conn.commit()
 
     return "activated"
 
 
 def disable_reminders(user_id: int):
-    """Disable all future reminders for the user."""
+    """Disable future reminders but retain the user's record."""
     now = time.time()
 
     with closing(connect_db()) as conn:
@@ -181,16 +172,32 @@ def disable_reminders(user_id: int):
                 next_send_at, active, last_sent_at
             )
             VALUES (?, ?, ?, ?, 0, NULL)
-            ON CONFLICT(user_id) DO UPDATE SET
-                active = 0
+            ON CONFLICT(user_id) DO UPDATE SET active = 0
         """, (
             user_id,
             now,
             now + CAMPAIGN_DURATION,
             now + REMINDER_INTERVAL,
         ))
-
         conn.commit()
+
+
+def get_user_counts():
+    """Return total recorded users, active campaigns and inactive campaigns."""
+    now = time.time()
+
+    with closing(connect_db()) as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM reminder_schedule"
+        ).fetchone()[0]
+
+        active = conn.execute("""
+            SELECT COUNT(*)
+            FROM reminder_schedule
+            WHERE active = 1 AND expires_at > ?
+        """, (now,)).fetchone()[0]
+
+    return total, active, total - active
 
 
 def get_due_users():
@@ -258,34 +265,26 @@ def schedule_retry(user_id: int, delay: float = RETRY_DELAY):
 
 
 # ============================================================
-# KEYBOARDS
+# KEYBOARDS AND MESSAGES
 # ============================================================
 
 def welcome_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "Join Our Channel",
-                url=CHANNEL_LINK,
-            )
-        ]
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "Join Our Channel",
+            url=CHANNEL_LINK,
+        )
+    ]])
 
 
 def promo_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "Visit Lemvest Channel",
-                url=CHANNEL_LINK,
-            )
-        ]
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "Visit Lemvest Channel",
+            url=CHANNEL_LINK,
+        )
+    ]])
 
-
-# ============================================================
-# WELCOME MESSAGE
-# ============================================================
 
 async def send_welcome(message):
     keyboard = welcome_keyboard()
@@ -299,7 +298,6 @@ async def send_welcome(message):
                     reply_markup=keyboard,
                 )
             return
-
         except (BadRequest, OSError):
             logger.exception(
                 "Welcome image failed; falling back to text"
@@ -311,10 +309,6 @@ async def send_welcome(message):
         disable_web_page_preview=True,
     )
 
-
-# ============================================================
-# PROMOTIONAL REMINDERS
-# ============================================================
 
 async def send_promo(bot, user_id: int):
     keyboard = promo_keyboard()
@@ -329,7 +323,6 @@ async def send_promo(bot, user_id: int):
                     reply_markup=keyboard,
                 )
             return
-
         except BadRequest:
             logger.exception(
                 "Promotional image failed for user %s; using text",
@@ -348,17 +341,13 @@ async def send_promo(bot, user_id: int):
 # BOT COMMANDS
 # ============================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
 
     if user is None or message is None:
         return
 
-    # Only private chats should receive personal reminder campaigns.
     if update.effective_chat and update.effective_chat.type != "private":
         await message.reply_text(
             "Please open this bot in a private chat and send /start."
@@ -366,15 +355,9 @@ async def start(
         return
 
     try:
-        status = await asyncio.to_thread(
-            activate_reminders,
-            user.id,
-        )
+        status = await asyncio.to_thread(activate_reminders, user.id)
     except Exception:
-        logger.exception(
-            "Failed to register user %s",
-            user.id,
-        )
+        logger.exception("Failed to register user %s", user.id)
         await message.reply_text(
             "Sorry, the bot is temporarily unavailable. Please try again."
         )
@@ -391,10 +374,7 @@ async def start(
         logger.info("Started reminder campaign for %s", user.id)
 
 
-async def stop(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
 
@@ -404,10 +384,7 @@ async def stop(
     try:
         await asyncio.to_thread(disable_reminders, user.id)
     except Exception:
-        logger.exception(
-            "Failed to disable reminders for %s",
-            user.id,
-        )
+        logger.exception("Failed to disable reminders for %s", user.id)
         await message.reply_text(
             "I couldn't save your request. Please try /stop again."
         )
@@ -419,22 +396,63 @@ async def stop(
     )
 
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_message:
         await update.effective_message.reply_text(
             "/start — Show the welcome image and join button\n"
             "/stop — Stop promotional reminders\n"
-            "/help — Show this help\n\n"
+            "/help — Show this help\n"
+            "/users — Admin-only user statistics\n\n"
             "Reminders are scheduled every 6 hours for up to 15 days "
             "after you start the bot. Send /stop to opt out."
         )
 
 
+async def users_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Admin-only user statistics command."""
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return
+
+    # Fail closed if the admin ID has not been configured.
+    if not ADMIN_USER_ID.isdigit():
+        logger.error("ADMIN_USER_ID is missing or invalid")
+        await message.reply_text(
+            "Admin access is not configured. Please check the bot settings."
+        )
+        return
+
+    if user.id != int(ADMIN_USER_ID):
+        await message.reply_text(
+            "You are not authorized to use this command."
+        )
+        logger.warning("Unauthorized /users attempt by %s", user.id)
+        return
+
+    try:
+        total, active, inactive = await asyncio.to_thread(get_user_counts)
+
+        await message.reply_text(
+            "Bot User Statistics\n\n"
+            f"Total recorded users: {total}\n"
+            f"Active reminder campaigns: {active}\n"
+            f"Stopped or expired campaigns: {inactive}\n\n"
+            "The total counts unique users recorded in the database."
+        )
+    except Exception:
+        logger.exception("Failed to retrieve user statistics")
+        await message.reply_text(
+            "Unable to retrieve user statistics right now."
+        )
+
+
 # ============================================================
-# BACKGROUND WORKER
+# BACKGROUND REMINDER WORKER
 # ============================================================
 
 async def reminder_loop(application: Application):
@@ -445,34 +463,18 @@ async def reminder_loop(application: Application):
             user_ids = await asyncio.to_thread(get_due_users)
 
             for user_id in user_ids:
-                claimed = await asyncio.to_thread(
-                    claim_reminder,
-                    user_id,
-                )
+                claimed = await asyncio.to_thread(claim_reminder, user_id)
 
                 if not claimed:
                     continue
 
                 try:
                     await send_promo(application.bot, user_id)
-
-                    await asyncio.to_thread(
-                        record_delivery,
-                        user_id,
-                    )
-
-                    logger.info(
-                        "Reminder delivered to %s",
-                        user_id,
-                    )
+                    await asyncio.to_thread(record_delivery, user_id)
+                    logger.info("Reminder delivered to %s", user_id)
 
                 except Forbidden:
-                    # User blocked the bot or Telegram no longer allows
-                    # the bot to message this user.
-                    await asyncio.to_thread(
-                        disable_reminders,
-                        user_id,
-                    )
+                    await asyncio.to_thread(disable_reminders, user_id)
                     logger.info(
                         "Disabled reminders for blocked user %s",
                         user_id,
@@ -491,12 +493,10 @@ async def reminder_loop(application: Application):
                         user_id,
                         delay + 2,
                     )
-
                     logger.warning(
                         "Telegram rate limit; pausing for %.1f seconds",
                         delay,
                     )
-
                     await asyncio.sleep(delay + 1)
                     break
 
@@ -505,27 +505,19 @@ async def reminder_loop(application: Application):
                         "Telegram error sending to %s",
                         user_id,
                     )
-                    await asyncio.to_thread(
-                        schedule_retry,
-                        user_id,
-                    )
+                    await asyncio.to_thread(schedule_retry, user_id)
 
                 except Exception:
                     logger.exception(
                         "Unexpected delivery failure for %s",
                         user_id,
                     )
-                    await asyncio.to_thread(
-                        schedule_retry,
-                        user_id,
-                    )
+                    await asyncio.to_thread(schedule_retry, user_id)
 
-                # Avoid sending a burst of messages.
                 await asyncio.sleep(SEND_DELAY)
 
         except asyncio.CancelledError:
             raise
-
         except Exception:
             logger.exception("Reminder worker cycle failed")
 
@@ -552,7 +544,6 @@ async def post_stop(application: Application):
 
     if task:
         task.cancel()
-
         with suppress(asyncio.CancelledError):
             await task
 
@@ -596,6 +587,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("users", users_command))
     application.add_error_handler(error_handler)
 
     logger.info("Starting Lemvest Telegram bot")
