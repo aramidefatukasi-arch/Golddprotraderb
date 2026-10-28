@@ -23,8 +23,8 @@ DB_FILE = BASE_DIR / "users.db"
 
 CHANNEL_LINK = "https://t.me/+CaYjuNbPEFA2NWU0"
 
-# ⚠️ REPLACE THIS WITH YOUR IMGUR LINK
-IMAGE_URL = "https://i.imgur.com/YOUR_IMAGE_LINK_HERE.jpg" 
+# ✅ DIRECT GITHUB IMAGE LINK (No Imgur blocks)
+IMAGE_URL = "https://raw.githubusercontent.com/aramidefatukasi-arch/Golddprotraderb/main/welcome.jpg" 
 
 WELCOME_TEXT = """Welcome to Lemvest Trading Lab!  
 
@@ -124,6 +124,7 @@ async def send_welcome(message):
     try:
         await message.reply_photo(photo=IMAGE_URL, caption=WELCOME_TEXT, reply_markup=keyboard)
     except Exception:
+        logger.exception("Failed to send photo, falling back to text.")
         await message.reply_text(text=WELCOME_TEXT, reply_markup=keyboard, disable_web_page_preview=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
