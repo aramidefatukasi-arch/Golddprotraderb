@@ -2,32 +2,22 @@
 import asyncio
 import logging
 import os
+import shutil
 import sqlite3
 import time
-from contextlib import closing, suppress
-from datetime import timedelta
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import (
-    BadRequest,
-    Forbidden,
-    NetworkError,
-    RetryAfter,
-    TelegramError,
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
 )
-from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ============================================================
+# --------------------------------------------------
 # CONFIGURATION
-# ============================================================
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("lemvest_bot")
-logging.getLogger("httpx").setLevel(logging.WARNING)
+# --------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
 IMAGE_PATH = BASE_DIR / "welcome.jpg"
@@ -39,50 +29,100 @@ CHANNEL_LINK = os.getenv(
     "https://t.me/+CaYjuNbPEFA2NWU0",
 ).strip()
 
-DB_FILE = Path(
-    os.getenv("DB_FILE", str(BASE_DIR / "users.db"))
-).expanduser()
-
 REMINDER_INTERVAL = 6 * 60 * 60
 CAMPAIGN_DURATION = 15 * 24 * 60 * 60
-CHECK_INTERVAL = 60
-BATCH_SIZE = 50
-RETRY_DELAY = 15 * 60
+CLAIM_TIMEOUT = 5 * 60
+RETRY_DELAY = 5 * 60
+CHECK_INTERVAL = 30
 
-WELCOME_TEXT = """Welcome to Lemvest Trading Lab!
+DATA_DIR = Path("/var/data")
+PERSISTENT_DB = DATA_DIR / "users.db"
+LEGACY_DB = BASE_DIR / "users.db"
 
-Here, I share trading insights, market analysis, educational content, and practical information to help you better understand the markets.
-
-We're just getting started, so you're early!
-
-Join for free and grow with us."""
-
-PROMO_TEXT = """Welcome to Lemvest Trading Lab!
-
-Explore trading insights, market analysis, educational content, and practical tools.
-
-Tap the button below to visit our channel.
-
-Send /stop at any time to stop reminders."""
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - lemvest_bot - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("lemvest_bot")
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+# --------------------------------------------------
+# DATABASE LOCATION AND SAFE LEGACY COPY
+# --------------------------------------------------
+
+def configure_database():
+    """
+    Prefer the persistent disk.
+    If the persistent database does not exist, copy a
+    legacy users.db into it before creating a new database.
+    Never overwrite an existing persistent database.
+    """
+    requested_path = os.getenv("DB_FILE", "").strip()
+
+    if requested_path:
+        db_path = Path(requested_path)
+    else:
+        db_path = PERSISTENT_DB
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not db_path.exists():
+        legacy_candidates = [
+            LEGACY_DB,
+            BASE_DIR / "data" / "users.db",
+            Path.cwd() / "users.db",
+        ]
+
+        for candidate in legacy_candidates:
+            try:
+                if (
+                    candidate.resolve() != db_path.resolve()
+                    and candidate.is_file()
+                ):
+                    shutil.copy2(candidate, db_path)
+                    logger.info(
+                        "Copied legacy database from %s to %s",
+                        candidate,
+                        db_path,
+                    )
+                    break
+            except OSError:
+                logger.exception(
+                    "Could not copy legacy database from %s",
+                    candidate,
+                )
+
+    logger.info("Database path: %s", db_path)
+    return db_path
+
+
+DB_PATH = configure_database()
+
 
 def connect_db():
-    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(
+        str(DB_PATH),
+        timeout=30,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 30000")
+    return connection
 
-    conn = sqlite3.connect(str(DB_FILE), timeout=30)
-    conn.execute("PRAGMA busy_timeout = 30000")
-    return conn
 
+def initialize_database():
+    with connect_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                first_seen REAL NOT NULL,
+                last_seen REAL NOT NULL,
+                blocked INTEGER NOT NULL DEFAULT 0
+            )
+        """)
 
-def init_db():
-    with closing(connect_db()) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-
-        conn.execute("""
+        db.execute("""
             CREATE TABLE IF NOT EXISTS reminder_schedule (
                 user_id INTEGER PRIMARY KEY,
                 started_at REAL NOT NULL,
@@ -94,64 +134,119 @@ def init_db():
             )
         """)
 
-        columns = {
-            row[1]
-            for row in conn.execute(
+        # Safely add columns when using an older database.
+        existing_columns = {
+            row["name"]
+            for row in db.execute(
                 "PRAGMA table_info(reminder_schedule)"
-            )
+            ).fetchall()
         }
 
-        if "claim_until" not in columns:
-            conn.execute(
-                "ALTER TABLE reminder_schedule "
-                "ADD COLUMN claim_until REAL"
-            )
+        required_columns = {
+            "started_at": "REAL",
+            "expires_at": "REAL",
+            "next_send_at": "REAL",
+            "active": "INTEGER NOT NULL DEFAULT 1",
+            "claim_until": "REAL",
+            "last_sent_at": "REAL",
+        }
 
-        if "last_sent_at" not in columns:
-            conn.execute(
-                "ALTER TABLE reminder_schedule "
-                "ADD COLUMN last_sent_at REAL"
-            )
+        for column, definition in required_columns.items():
+            if column not in existing_columns:
+                db.execute(
+                    f"ALTER TABLE reminder_schedule "
+                    f"ADD COLUMN {column} {definition}"
+                )
 
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_reminder_due
-            ON reminder_schedule(active, next_send_at, expires_at)
-        """)
+        # Make sure every previously scheduled user is in users.
+        now = time.time()
+        db.execute("""
+            INSERT OR IGNORE INTO users
+                (user_id, username, first_name, first_seen, last_seen)
+            SELECT user_id, NULL, NULL, ?, ?
+            FROM reminder_schedule
+        """, (now, now))
 
-        conn.commit()
+        # Recover schedules that were left with an expired claim.
+        db.execute("""
+            UPDATE reminder_schedule
+            SET claim_until = NULL
+            WHERE claim_until IS NOT NULL
+              AND claim_until < ?
+        """, (now,))
 
-    logger.info("Database initialized: %s", DB_FILE)
+    logger.info("Database initialized successfully")
 
 
-def register_user(user_id: int) -> str:
-    """Start a campaign without resetting an active schedule."""
+# --------------------------------------------------
+# USER REGISTRATION
+# --------------------------------------------------
+
+def register_user(user):
     now = time.time()
 
-    with closing(connect_db()) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with connect_db() as db:
+        db.execute("""
+            INSERT INTO users
+                (user_id, username, first_name, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                last_seen = excluded.last_seen
+        """, (
+            user.id,
+            user.username,
+            user.first_name,
+            now,
+            now,
+        ))
 
-        row = conn.execute("""
+        db.execute("""
+            UPDATE users
+            SET blocked = 0
+            WHERE user_id = ?
+        """, (user.id,))
+
+
+def get_user_counts():
+    with connect_db() as db:
+        total = db.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()[0]
+
+        active = db.execute("""
+            SELECT COUNT(*)
+            FROM reminder_schedule
+            WHERE active = 1 AND expires_at > ?
+        """, (time.time(),)).fetchone()[0]
+
+        return total, active
+
+
+# --------------------------------------------------
+# REMINDER SCHEDULE
+# --------------------------------------------------
+
+def start_campaign(user_id):
+    now = time.time()
+
+    with connect_db() as db:
+        existing = db.execute("""
             SELECT active, expires_at
             FROM reminder_schedule
             WHERE user_id = ?
         """, (user_id,)).fetchone()
 
-        if row and row[0] == 1 and row[1] > now:
-            conn.commit()
-            return "already_active"
+        # Do not reset an existing active campaign.
+        if existing and existing["active"] and existing["expires_at"] > now:
+            return False
 
-        conn.execute("""
-            INSERT INTO reminder_schedule (
-                user_id,
-                started_at,
-                expires_at,
-                next_send_at,
-                active,
-                claim_until,
-                last_sent_at
-            )
+        db.execute("""
+            INSERT INTO reminder_schedule
+                (user_id, started_at, expires_at, next_send_at,
+                 active, claim_until, last_sent_at)
             VALUES (?, ?, ?, ?, 1, NULL, NULL)
-
             ON CONFLICT(user_id) DO UPDATE SET
                 started_at = excluded.started_at,
                 expires_at = excluded.expires_at,
@@ -166,320 +261,223 @@ def register_user(user_id: int) -> str:
             now + REMINDER_INTERVAL,
         ))
 
-        conn.commit()
-
-    return "activated"
+        return True
 
 
-def disable_reminders(user_id: int):
-    now = time.time()
-
-    with closing(connect_db()) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-
-        conn.execute("""
-            INSERT INTO reminder_schedule (
-                user_id,
-                started_at,
-                expires_at,
-                next_send_at,
-                active,
-                claim_until,
-                last_sent_at
-            )
-            VALUES (?, ?, ?, ?, 0, NULL, NULL)
-
-            ON CONFLICT(user_id) DO UPDATE SET
-                active = 0,
-                claim_until = NULL
-        """, (
-            user_id,
-            now,
-            now + CAMPAIGN_DURATION,
-            now + REMINDER_INTERVAL,
-        ))
-
-        conn.commit()
+def stop_campaign(user_id):
+    with connect_db() as db:
+        db.execute("""
+            UPDATE reminder_schedule
+            SET active = 0, claim_until = NULL
+            WHERE user_id = ?
+        """, (user_id,))
 
 
-def get_user_counts():
-    now = time.time()
-
-    with closing(connect_db()) as conn:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM reminder_schedule"
-        ).fetchone()[0]
-
-        active = conn.execute("""
-            SELECT COUNT(*)
-            FROM reminder_schedule
-            WHERE active = 1 AND expires_at > ?
-        """, (now,)).fetchone()[0]
-
-    return total, active, total - active
-
-
-def get_due_users():
-    now = time.time()
-
-    with closing(connect_db()) as conn:
-        rows = conn.execute("""
-            SELECT user_id
-            FROM reminder_schedule
-            WHERE active = 1
-              AND next_send_at <= ?
-              AND expires_at > ?
-              AND (claim_until IS NULL OR claim_until < ?)
-            ORDER BY next_send_at
-            LIMIT ?
-        """, (
-            now,
-            now,
-            now,
-            BATCH_SIZE,
-        )).fetchall()
-
-    return [row[0] for row in rows]
-
-
-def claim_reminder(user_id: int) -> bool:
+def claim_due_reminder():
     """
-    Temporarily claim a due reminder.
-    IMPORTANT: Do not advance next_send_at here.
+    Atomically claim one due reminder without advancing
+    next_send_at. The next send time changes only after
+    a successful Telegram delivery.
     """
     now = time.time()
 
-    with closing(connect_db()) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with connect_db() as db:
+        db.execute("BEGIN IMMEDIATE")
 
-        result = conn.execute("""
+        row = db.execute("""
+            SELECT s.user_id
+            FROM reminder_schedule AS s
+            JOIN users AS u ON u.user_id = s.user_id
+            WHERE s.active = 1
+              AND s.expires_at > ?
+              AND s.next_send_at <= ?
+              AND (s.claim_until IS NULL OR s.claim_until < ?)
+              AND u.blocked = 0
+            ORDER BY s.next_send_at ASC
+            LIMIT 1
+        """, (now, now, now)).fetchone()
+
+        if row is None:
+            db.commit()
+            return None
+
+        user_id = row["user_id"]
+
+        db.execute("""
             UPDATE reminder_schedule
             SET claim_until = ?
             WHERE user_id = ?
-              AND active = 1
-              AND next_send_at <= ?
-              AND expires_at > ?
-              AND (claim_until IS NULL OR claim_until < ?)
-        """, (
-            now + 300,
-            user_id,
-            now,
-            now,
-            now,
-        ))
+        """, (now + CLAIM_TIMEOUT, user_id))
 
-        conn.commit()
-
-    return result.rowcount == 1
+        db.commit()
+        return user_id
 
 
-def record_delivery(user_id: int):
-    """Schedule the next reminder six hours after successful delivery."""
+def record_delivery(user_id):
     now = time.time()
 
-    with closing(connect_db()) as conn:
-        conn.execute("""
-            UPDATE reminder_schedule
-            SET last_sent_at = ?,
-                next_send_at = MIN(expires_at, ?),
-                claim_until = NULL
-            WHERE user_id = ? AND active = 1
-        """, (
-            now,
-            now + REMINDER_INTERVAL,
-            user_id,
-        ))
+    with connect_db() as db:
+        row = db.execute("""
+            SELECT expires_at
+            FROM reminder_schedule
+            WHERE user_id = ?
+        """, (user_id,)).fetchone()
 
-        conn.commit()
+        if row is None:
+            return
+
+        if now >= row["expires_at"]:
+            db.execute("""
+                UPDATE reminder_schedule
+                SET active = 0, claim_until = NULL,
+                    last_sent_at = ?
+                WHERE user_id = ?
+            """, (now, user_id))
+        else:
+            db.execute("""
+                UPDATE reminder_schedule
+                SET last_sent_at = ?,
+                    next_send_at = ?,
+                    claim_until = NULL,
+                    active = CASE
+                        WHEN expires_at > ? THEN 1
+                        ELSE 0
+                    END
+                WHERE user_id = ?
+            """, (
+                now,
+                now + REMINDER_INTERVAL,
+                now,
+                user_id,
+            ))
 
 
-def schedule_retry(user_id: int, delay: float = RETRY_DELAY):
-    """Retry a failed delivery later, not every minute."""
+def record_delivery_failure(user_id, blocked=False):
     now = time.time()
 
-    with closing(connect_db()) as conn:
-        conn.execute("""
+    with connect_db() as db:
+        db.execute("""
             UPDATE reminder_schedule
-            SET next_send_at = MIN(expires_at, ?),
-                claim_until = NULL
-            WHERE user_id = ? AND active = 1
-        """, (
-            now + max(1, delay),
-            user_id,
-        ))
+            SET claim_until = NULL,
+                next_send_at = ?,
+                active = CASE WHEN ? = 1 THEN 0 ELSE active END
+            WHERE user_id = ?
+        """, (now + RETRY_DELAY, int(blocked), user_id))
 
-        conn.commit()
-
-
-# ============================================================
-# IMAGE AND MESSAGE SENDING
-# ============================================================
-
-def channel_keyboard(label: str):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(label, url=CHANNEL_LINK)
-    ]])
+        if blocked:
+            db.execute("""
+                UPDATE users SET blocked = 1 WHERE user_id = ?
+            """, (user_id,))
 
 
-async def send_photo_or_text(
-    *,
-    message=None,
-    bot=None,
-    chat_id=None,
-    caption: str,
-    keyboard,
+# --------------------------------------------------
+# TELEGRAM COMMANDS
+# --------------------------------------------------
+
+WELCOME_TEXT = (
+    "Welcome to Lemvest Trading Lab.\n\n"
+    "Thank you for connecting with us. Join our Telegram "
+    "channel to receive our updates and information.\n\n"
+    "Your reminders are scheduled every 6 hours for up to "
+    "15 days. You can stop them at any time with /stop."
+)
+
+REMINDER_TEXT = (
+    "Lemvest Trading Lab reminder\n\n"
+    "Visit our Telegram channel to keep up with our updates."
+)
+
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
 ):
-    """
-    Upload welcome.jpg directly from the project folder.
-    If the image is missing or rejected, send the text instead.
-    """
-    if not IMAGE_PATH.is_file():
-        logger.error(
-            "Image file is missing: %s. Add welcome.jpg beside bot.py.",
-            IMAGE_PATH,
-        )
-
-        if message is not None:
-            await message.reply_text(
-                caption,
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
-        else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=caption,
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
-        return
-
-    try:
-        with IMAGE_PATH.open("rb") as photo:
-            if message is not None:
-                await message.reply_photo(
-                    photo=photo,
-                    caption=caption,
-                    reply_markup=keyboard,
-                )
-            else:
-                await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=photo,
-                    caption=caption,
-                    reply_markup=keyboard,
-                )
-
-    except (BadRequest, OSError):
-        logger.exception("Image upload failed; falling back to text")
-
-        if message is not None:
-            await message.reply_text(
-                caption,
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
-        else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=caption,
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
-
-
-async def send_welcome(message):
-    await send_photo_or_text(
-        message=message,
-        caption=WELCOME_TEXT,
-        keyboard=channel_keyboard("Join Our Channel"),
-    )
-
-
-async def send_promo(bot, user_id: int):
-    await send_photo_or_text(
-        bot=bot,
-        chat_id=user_id,
-        caption=PROMO_TEXT,
-        keyboard=channel_keyboard("Visit Lemvest Channel"),
-    )
-
-
-# ============================================================
-# BOT COMMANDS
-# ============================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
-    chat = update.effective_chat
 
-    if user is None or message is None:
+    if not user or not message:
         return
 
-    if chat is None or chat.type != "private":
-        await message.reply_text(
-            "Please open this bot in a private chat and send /start."
+    register_user(user)
+    created = start_campaign(user.id)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "Join Lemvest Trading Lab",
+            url=CHANNEL_LINK,
         )
-        return
+    ]])
 
     try:
-        status = await asyncio.to_thread(register_user, user.id)
-    except Exception:
-        logger.exception("Failed to register user %s", user.id)
+        if IMAGE_PATH.is_file():
+            with IMAGE_PATH.open("rb") as image:
+                await message.reply_photo(
+                    photo=image,
+                    caption=WELCOME_TEXT,
+                    reply_markup=keyboard,
+                )
+        else:
+            logger.warning("welcome.jpg was not found at %s", IMAGE_PATH)
+            await message.reply_text(
+                WELCOME_TEXT,
+                reply_markup=keyboard,
+            )
+    except (TelegramError, OSError):
+        logger.exception("Could not send welcome image")
         await message.reply_text(
-            "Sorry, the bot is temporarily unavailable. Please try again."
+            WELCOME_TEXT,
+            reply_markup=keyboard,
         )
-        return
 
-    await send_welcome(message)
-
-    if status == "activated":
+    if not created:
         await message.reply_text(
-            "Reminders are enabled. Your first reminder will arrive in "
-            "6 hours, then every 6 hours for up to 15 days. "
-            "Send /stop to opt out."
+            "Your reminders are already active. "
+            "Your existing schedule has not been reset.\n\n"
+            "Use /help to see the available commands."
         )
     else:
         await message.reply_text(
-            "Your reminders are already active. Your existing schedule "
-            "has not been reset."
+            "Your reminders are now active. "
+            "Your first reminder will arrive in 6 hours."
         )
 
-    logger.info("/start handled for user %s: %s", user.id, status)
+    logger.info("Processed /start for user_id=%s", user.id)
 
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     user = update.effective_user
     message = update.effective_message
 
-    if user is None or message is None:
+    if not user or not message:
         return
 
-    try:
-        await asyncio.to_thread(disable_reminders, user.id)
+    stop_campaign(user.id)
+    await message.reply_text(
+        "Your reminders have been stopped. "
+        "You can send /start if you want to start them again."
+    )
+    logger.info("Stopped reminders for user_id=%s", user.id)
 
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.effective_message
+
+    if message:
         await message.reply_text(
-            "Your reminders have been stopped. "
-            "Send /start to opt in again."
-        )
-
-    except Exception:
-        logger.exception("Failed to stop reminders for %s", user.id)
-        await message.reply_text(
-            "I couldn't save your request. Please try /stop again."
-        )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_message:
-        await update.effective_message.reply_text(
+            "Lemvest Trading Lab Bot\n\n"
             "/start — Show welcome message and enable reminders\n"
             "/stop — Stop reminders\n"
             "/help — Show help\n"
-            "/users — Admin-only user statistics\n\n"
-            "The first reminder is sent after 6 hours, then every "
-            "6 hours for up to 15 days."
+            "/users — Admin-only user statistics\n"
+            "/diag — Check whether the bot is responding\n\n"
+            "The first reminder is sent after 6 hours, then "
+            "every 6 hours for up to 15 days."
         )
 
 
@@ -490,180 +488,147 @@ async def users_command(
     user = update.effective_user
     message = update.effective_message
 
-    if user is None or message is None:
+    if not user or not message:
         return
 
-    if not ADMIN_USER_ID.isdigit():
-        await message.reply_text(
-            "Admin access is not configured. Check Render environment variables."
-        )
-        logger.error("ADMIN_USER_ID is missing or invalid")
+    if not ADMIN_USER_ID or str(user.id) != ADMIN_USER_ID:
+        await message.reply_text("You are not authorized to use this command.")
         return
 
-    if user.id != int(ADMIN_USER_ID):
-        await message.reply_text(
-            "You are not authorized to use this command."
+    total, active = get_user_counts()
+
+    await message.reply_text(
+        "Lemvest Trading Lab Statistics\n\n"
+        f"Registered bot users: {total}\n"
+        f"Users with active reminders: {active}\n\n"
+        "Registered bot users are people who have started "
+        "the bot, not necessarily channel members."
+    )
+
+
+async def diag_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.effective_message
+    user = update.effective_user
+
+    if message:
+        logger.info(
+            "DIAGNOSTIC: received command from user_id=%s",
+            user.id if user else None,
         )
-        return
-
-    try:
-        total, active, inactive = await asyncio.to_thread(get_user_counts)
-
         await message.reply_text(
-            "Bot User Statistics\n\n"
-            f"Total users: {total}\n"
-            f"Active reminder campaigns: {active}\n"
-            f"Stopped or expired campaigns: {inactive}"
-        )
-
-    except Exception:
-        logger.exception("Failed to retrieve user statistics")
-        await message.reply_text(
-            "Unable to retrieve statistics right now."
+            "The bot is online and receiving commands."
         )
 
 
-# ============================================================
-# BACKGROUND REMINDER WORKER
-# ============================================================
+# --------------------------------------------------
+# REMINDER WORKER
+# --------------------------------------------------
 
 async def reminder_loop(application: Application):
-    logger.info(
-        "Reminder worker started. Schedule check interval: %s seconds",
-        CHECK_INTERVAL,
-    )
+    logger.info("Reminder worker started")
 
     while True:
+        user_id = None
+
         try:
-            user_ids = await asyncio.to_thread(get_due_users)
+            user_id = claim_due_reminder()
 
-            for user_id in user_ids:
-                claimed = await asyncio.to_thread(claim_reminder, user_id)
+            if user_id is None:
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
 
-                if not claimed:
-                    continue
+            try:
+                await application.bot.send_message(
+                    chat_id=user_id,
+                    text=REMINDER_TEXT,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "Visit Lemvest Trading Lab",
+                            url=CHANNEL_LINK,
+                        )
+                    ]]),
+                )
+            except TelegramError as exc:
+                logger.warning(
+                    "Reminder failed for user_id=%s: %s",
+                    user_id,
+                    exc,
+                )
 
-                try:
-                    await send_promo(application.bot, user_id)
+                error_text = str(exc).lower()
+                blocked = (
+                    "bot was blocked by the user" in error_text
+                    or "user is deactivated" in error_text
+                    or "chat not found" in error_text
+                )
 
-                    # Advance the schedule only after successful delivery.
-                    await asyncio.to_thread(record_delivery, user_id)
-
-                    logger.info(
-                        "Reminder sent to %s. Next reminder due in six hours.",
-                        user_id,
-                    )
-
-                except Forbidden:
-                    await asyncio.to_thread(disable_reminders, user_id)
-                    logger.info(
-                        "Reminders disabled for blocked user %s",
-                        user_id,
-                    )
-
-                except RetryAfter as exc:
-                    delay = exc.retry_after
-
-                    if isinstance(delay, timedelta):
-                        delay = delay.total_seconds()
-
-                    delay = float(delay)
-
-                    await asyncio.to_thread(
-                        schedule_retry,
-                        user_id,
-                        delay + 2,
-                    )
-
-                    logger.warning(
-                        "Telegram rate limit. Retry after %.1f seconds.",
-                        delay,
-                    )
-
-                    await asyncio.sleep(delay + 1)
-                    break
-
-                except (NetworkError, TelegramError):
-                    logger.exception(
-                        "Telegram delivery failed for user %s",
-                        user_id,
-                    )
-                    await asyncio.to_thread(schedule_retry, user_id)
-
-                except Exception:
-                    logger.exception(
-                        "Unexpected delivery error for user %s",
-                        user_id,
-                    )
-                    await asyncio.to_thread(schedule_retry, user_id)
-
-                await asyncio.sleep(1)
+                record_delivery_failure(user_id, blocked=blocked)
+            else:
+                record_delivery(user_id)
+                logger.info(
+                    "Reminder sent successfully to user_id=%s",
+                    user_id,
+                )
 
         except asyncio.CancelledError:
+            logger.info("Reminder worker stopped")
             raise
-
         except Exception:
-            logger.exception("Reminder worker cycle failed")
+            logger.exception("Unexpected error in reminder worker")
 
-        # This only checks the database. It does NOT send a message
-        # unless that user's scheduled due time has passed.
-        await asyncio.sleep(CHECK_INTERVAL)
+            if user_id is not None:
+                try:
+                    record_delivery_failure(user_id)
+                except Exception:
+                    logger.exception("Could not release failed reminder")
 
+            await asyncio.sleep(CHECK_INTERVAL)
 
-# ============================================================
-# STARTUP AND SHUTDOWN
-# ============================================================
 
 async def post_init(application: Application):
-    await asyncio.to_thread(init_db)
+    initialize_database()
 
-    application.bot_data["reminder_task"] = asyncio.create_task(
-        reminder_loop(application),
-        name="lemvest-reminder-loop",
-    )
+    task = asyncio.create_task(reminder_loop(application))
+    application.bot_data["reminder_task"] = task
 
-    logger.info("Background reminder task started")
+    logger.info("Lemvest Trading Lab bot started successfully")
 
 
 async def post_stop(application: Application):
-    task = application.bot_data.pop("reminder_task", None)
+    task = application.bot_data.get("reminder_task")
 
     if task:
         task.cancel()
-
-        with suppress(asyncio.CancelledError):
+        try:
             await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if context.error:
-        logger.error(
-            "Unhandled bot error",
-            exc_info=(
-                type(context.error),
-                context.error,
-                context.error.__traceback__,
-            ),
-        )
+    logger.error(
+        "Telegram handler error",
+        exc_info=context.error,
+    )
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# --------------------------------------------------
+# START APPLICATION
+# --------------------------------------------------
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Set TELEGRAM_BOT_TOKEN in Render environment variables."
+            "TELEGRAM_BOT_TOKEN is missing from environment variables"
         )
 
-    if not CHANNEL_LINK.startswith("https://t.me/"):
-        raise RuntimeError(
-            "CHANNEL_LINK must start with https://t.me/"
-        )
+    initialize_database()
 
     application = (
         Application.builder()
@@ -673,10 +638,11 @@ def main():
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stop", stop))
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("stop", stop_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("diag", diag_command))
     application.add_error_handler(error_handler)
 
     logger.info("Starting Lemvest Trading Lab bot")
