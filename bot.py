@@ -1,677 +1,906 @@
 
-import asyncio
-import logging
 import os
-import shutil
+import io
+import re
 import sqlite3
-import time
-from pathlib import Path
+import logging
+from datetime import datetime, timezone
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import Forbidden, TelegramError
+import qrcode
+import barcode
+from barcode.writer import ImageWriter
+from PIL import Image, ImageDraw, ImageFont
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton
+)
+
 from telegram.ext import (
     Application,
     CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
+    filters
 )
 
-# --------------------------------------------------
+
+# ==========================================
 # CONFIGURATION
-# --------------------------------------------------
-
-BASE_DIR = Path(__file__).resolve().parent
-IMAGE_PATH = BASE_DIR / "welcome.jpg"
-
-DATA_DIR = Path("/var/data")
-PERSISTENT_DB = DATA_DIR / "users.db"
-LEGACY_DB = BASE_DIR / "users.db"
+# ==========================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 
 CHANNEL_LINK = os.getenv(
     "CHANNEL_LINK",
-    "https://t.me/+CaYjuNbPEFA2NWU0",
+    "https://t.me/yourchannel"
 ).strip()
 
-REMINDER_INTERVAL = 6 * 60 * 60
-CAMPAIGN_DURATION = 15 * 24 * 60 * 60
-CLAIM_DURATION = 5 * 60
-RETRY_DELAY = 5 * 60
-REMINDER_CHECK_INTERVAL = 30
+PROMO_TEXT = os.getenv(
+    "PROMO_TEXT",
+    "Welcome! Join our channel to receive updates and announcements."
+)
+
+DB_PATH = os.getenv("DB_PATH", "users.db")
+
+# LOGO = Normal utility mode
+# REDIRECT = Promotional mode
+
+GLOBAL_BOT_MODE = "LOGO"
+
+
+# ==========================================
+# LOGGING
+# ==========================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
+
 logger = logging.getLogger(__name__)
 
-DB_PATH = None
 
-
-# --------------------------------------------------
+# ==========================================
 # DATABASE
-# --------------------------------------------------
+# ==========================================
 
-def configure_database():
-    """Use the Render persistent disk for the SQLite database."""
-    global DB_PATH
+def init_db():
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
 
-    # Respect an explicitly configured database path.
-    configured_path = os.getenv("DB_FILE", "").strip()
-
-    if configured_path:
-        DB_PATH = Path(configured_path)
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        DB_PATH = PERSISTENT_DB
-
-    # Copy a legacy database only if the destination does not exist.
-    # Never overwrite an existing persistent database.
-    if not DB_PATH.exists():
-        candidates = [
-            LEGACY_DB,
-            BASE_DIR / "data" / "users.db",
-            Path.cwd() / "users.db",
-        ]
-
-        for candidate in candidates:
-            try:
-                if candidate.resolve() == DB_PATH.resolve():
-                    continue
-
-                if candidate.is_file():
-                    shutil.copy2(candidate, DB_PATH)
-                    logger.info(
-                        "Copied existing database from %s to %s",
-                        candidate,
-                        DB_PATH,
-                    )
-                    break
-            except OSError:
-                logger.exception(
-                    "Could not copy legacy database from %s",
-                    candidate,
-                )
-
-    logger.info("Database path: %s", DB_PATH)
-
-
-def get_db_connection():
-    if DB_PATH is None:
-        configure_database()
-
-    connection = sqlite3.connect(str(DB_PATH), timeout=30)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 30000")
-    return connection
-
-
-def initialize_database():
-    """Create tables and add columns needed by the reminder system."""
-    configure_database()
-
-    with get_db_connection() as connection:
-        connection.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                first_seen REAL NOT NULL DEFAULT 0,
-                last_seen REAL NOT NULL DEFAULT 0,
-                blocked INTEGER NOT NULL DEFAULT 0
+                first_seen TEXT NOT NULL
             )
         """)
 
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS reminder_schedule (
-                user_id INTEGER PRIMARY KEY,
-                started_at REAL NOT NULL DEFAULT 0,
-                expires_at REAL NOT NULL DEFAULT 0,
-                next_send_at REAL NOT NULL DEFAULT 0,
-                active INTEGER NOT NULL DEFAULT 1,
-                claim_until REAL NOT NULL DEFAULT 0,
-                last_sent_at REAL NOT NULL DEFAULT 0
-            )
-        """)
-
-        # Add any missing columns to an older database.
-        required_columns = {
-            "users": {
-                "username": "TEXT",
-                "first_name": "TEXT",
-                "first_seen": "REAL NOT NULL DEFAULT 0",
-                "last_seen": "REAL NOT NULL DEFAULT 0",
-                "blocked": "INTEGER NOT NULL DEFAULT 0",
-            },
-            "reminder_schedule": {
-                "started_at": "REAL NOT NULL DEFAULT 0",
-                "expires_at": "REAL NOT NULL DEFAULT 0",
-                "next_send_at": "REAL NOT NULL DEFAULT 0",
-                "active": "INTEGER NOT NULL DEFAULT 1",
-                "claim_until": "REAL NOT NULL DEFAULT 0",
-                "last_sent_at": "REAL NOT NULL DEFAULT 0",
-            },
-        }
-
-        for table, columns in required_columns.items():
-            existing = {
-                row["name"]
-                for row in connection.execute(
-                    f"PRAGMA table_info({table})"
-                ).fetchall()
-            }
-
-            for column, definition in columns.items():
-                if column not in existing:
-                    connection.execute(
-                        f"ALTER TABLE {table} "
-                        f"ADD COLUMN {column} {definition}"
-                    )
-
-        # Ensure users with reminder schedules are also registered.
-        connection.execute("""
-            INSERT OR IGNORE INTO users (
-                user_id, first_seen, last_seen, blocked
-            )
-            SELECT user_id, started_at, started_at, 0
-            FROM reminder_schedule
-        """)
-
-        # Expire old campaigns and clear stale claims.
-        now = time.time()
-
-        connection.execute("""
-            UPDATE reminder_schedule
-            SET active = 0, claim_until = 0
-            WHERE expires_at > 0 AND expires_at <= ?
-        """, (now,))
-
-        connection.execute("""
-            UPDATE reminder_schedule
-            SET claim_until = 0
-            WHERE claim_until > 0 AND claim_until <= ?
-        """, (now,))
-
-    logger.info("Database initialized successfully")
+        conn.commit()
 
 
-def register_user(user):
-    now = time.time()
+def save_user(user_id):
 
-    with get_db_connection() as connection:
-        connection.execute("""
-            INSERT INTO users (
-                user_id, username, first_name,
-                first_seen, last_seen, blocked
-            )
-            VALUES (?, ?, ?, ?, ?, 0)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name,
-                last_seen = excluded.last_seen
-        """, (
-            user.id,
-            user.username,
-            user.first_name,
-            now,
-            now,
-        ))
+    with sqlite3.connect(DB_PATH) as conn:
 
-
-def start_reminders(user_id):
-    """Start a campaign only if the user has no active campaign."""
-    now = time.time()
-
-    with get_db_connection() as connection:
-        existing = connection.execute("""
-            SELECT active, expires_at
-            FROM reminder_schedule
-            WHERE user_id = ?
-        """, (user_id,)).fetchone()
-
-        if (
-            existing
-            and existing["active"]
-            and existing["expires_at"] > now
-        ):
-            return False
-
-        connection.execute("""
-            INSERT INTO reminder_schedule (
-                user_id, started_at, expires_at,
-                next_send_at, active, claim_until, last_sent_at
-            )
-            VALUES (?, ?, ?, ?, 1, 0, 0)
-            ON CONFLICT(user_id) DO UPDATE SET
-                started_at = excluded.started_at,
-                expires_at = excluded.expires_at,
-                next_send_at = excluded.next_send_at,
-                active = 1,
-                claim_until = 0,
-                last_sent_at = 0
-        """, (
-            user_id,
-            now,
-            now + CAMPAIGN_DURATION,
-            now + REMINDER_INTERVAL,
-        ))
-
-    return True
-
-
-def stop_reminders(user_id):
-    with get_db_connection() as connection:
-        cursor = connection.execute("""
-            UPDATE reminder_schedule
-            SET active = 0, claim_until = 0
-            WHERE user_id = ? AND active = 1
-        """, (user_id,))
-
-    return cursor.rowcount > 0
-
-
-def get_user_statistics():
-    now = time.time()
-
-    with get_db_connection() as connection:
-        total_users = connection.execute("""
-            SELECT COUNT(*) AS total FROM users
-        """).fetchone()["total"]
-
-        active_reminders = connection.execute("""
-            SELECT COUNT(*) AS total
-            FROM reminder_schedule
-            WHERE active = 1 AND expires_at > ?
-        """, (now,)).fetchone()["total"]
-
-        blocked_users = connection.execute("""
-            SELECT COUNT(*) AS total
-            FROM users
-            WHERE blocked = 1
-        """).fetchone()["total"]
-
-    return total_users, active_reminders, blocked_users
-
-
-def claim_due_reminder():
-    """Claim one due reminder so it isn't sent twice concurrently."""
-    now = time.time()
-
-    with get_db_connection() as connection:
-        connection.execute("""
-            UPDATE reminder_schedule
-            SET active = 0, claim_until = 0
-            WHERE active = 1
-              AND expires_at > 0
-              AND expires_at <= ?
-        """, (now,))
-
-        row = connection.execute("""
-            SELECT user_id, expires_at
-            FROM reminder_schedule
-            WHERE active = 1
-              AND next_send_at <= ?
-              AND expires_at > ?
-              AND (claim_until = 0 OR claim_until <= ?)
-            ORDER BY next_send_at ASC
-            LIMIT 1
-        """, (now, now, now)).fetchone()
-
-        if row is None:
-            return None
-
-        cursor = connection.execute("""
-            UPDATE reminder_schedule
-            SET claim_until = ?
-            WHERE user_id = ?
-              AND active = 1
-              AND (claim_until = 0 OR claim_until <= ?)
-        """, (
-            now + CLAIM_DURATION,
-            row["user_id"],
-            now,
-        ))
-
-        if cursor.rowcount != 1:
-            return None
-
-        return row["user_id"], row["expires_at"]
-
-
-def finish_reminder(user_id, success, blocked=False):
-    now = time.time()
-
-    with get_db_connection() as connection:
-        if blocked:
-            connection.execute("""
-                UPDATE users SET blocked = 1
-                WHERE user_id = ?
-            """, (user_id,))
-
-            connection.execute("""
-                UPDATE reminder_schedule
-                SET active = 0, claim_until = 0
-                WHERE user_id = ?
-            """, (user_id,))
-            return
-
-        if success:
-            connection.execute("""
-                UPDATE reminder_schedule
-                SET last_sent_at = ?,
-                    next_send_at = ?,
-                    claim_until = 0,
-                    active = CASE
-                        WHEN expires_at <= ? THEN 0
-                        ELSE active
-                    END
-                WHERE user_id = ?
-            """, (
-                now,
-                now + REMINDER_INTERVAL,
-                now,
+        conn.execute(
+            "INSERT OR IGNORE INTO users VALUES (?, ?)",
+            (
                 user_id,
-            ))
-        else:
-            connection.execute("""
-                UPDATE reminder_schedule
-                SET next_send_at = ?,
-                    claim_until = 0
-                WHERE user_id = ?
-            """, (
-                now + RETRY_DELAY,
-                user_id,
-            ))
-
-
-# --------------------------------------------------
-# COMMANDS
-# --------------------------------------------------
-
-def is_admin(user_id):
-    return ADMIN_USER_ID != 0 and user_id == ADMIN_USER_ID
-
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not update.effective_user or not update.effective_chat:
-        return
-
-    user = update.effective_user
-    register_user(user)
-
-    newly_started = start_reminders(user.id)
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Join Lemvest Trading Lab", url=CHANNEL_LINK)]
-    ])
-
-    welcome_text = (
-        "Welcome to Lemvest Trading Lab.\n\n"
-        "Join our channel to stay connected.\n\n"
-        "Your first reminder will arrive after 6 hours, "
-        "then every 6 hours for up to 15 days. "
-        "You can stop reminders anytime with /stop."
-    )
-
-    try:
-        if IMAGE_PATH.is_file():
-            with IMAGE_PATH.open("rb") as image_file:
-                await update.effective_chat.send_photo(
-                    photo=image_file,
-                    caption=welcome_text,
-                    reply_markup=keyboard,
-                )
-        else:
-            await update.effective_chat.send_message(
-                text=welcome_text,
-                reply_markup=keyboard,
+                datetime.now(timezone.utc).isoformat()
             )
-    except TelegramError:
-        logger.exception("Could not send the welcome message")
-        await update.effective_chat.send_message(welcome_text)
-
-    if not newly_started:
-        await update.effective_chat.send_message(
-            "Your reminders are already active. "
-            "Your existing schedule has not been reset."
         )
 
+        conn.commit()
 
-async def stop_command(
+
+def user_count():
+
+    with sqlite3.connect(DB_PATH) as conn:
+
+        result = conn.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()
+
+        return result[0]
+
+
+def is_admin(update):
+
+    return bool(
+        update.effective_user
+        and ADMIN_USER_ID
+        and update.effective_user.id == ADMIN_USER_ID
+    )
+
+
+# ==========================================
+# MAIN MENU
+# ==========================================
+
+def main_keyboard():
+
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("Logo Maker"),
+                KeyboardButton("QR Code Generator")
+            ],
+            [
+                KeyboardButton("Barcode Generator"),
+                KeyboardButton("Help")
+            ]
+        ],
+        resize_keyboard=True
+    )
+
+
+# ==========================================
+# LOGO GENERATOR
+# ==========================================
+
+def create_logo(text, style):
+
+    palettes = {
+
+        "blue": (
+            (12, 32, 72),
+            (34, 126, 230),
+            (255, 255, 255)
+        ),
+
+        "dark": (
+            (18, 18, 24),
+            (65, 65, 82),
+            (255, 255, 255)
+        ),
+
+        "gold": (
+            (42, 28, 8),
+            (176, 128, 36),
+            (255, 245, 210)
+        ),
+
+        "purple": (
+            (42, 18, 72),
+            (132, 70, 190),
+            (255, 255, 255)
+        ),
+
+        "green": (
+            (10, 54, 43),
+            (28, 145, 105),
+            (255, 255, 255)
+        )
+
+    }
+
+    top, bottom, foreground = palettes.get(
+        style,
+        palettes["blue"]
+    )
+
+    width = 1000
+    height = 600
+
+    image = Image.new("RGB", (width, height))
+
+    pixels = image.load()
+
+    # Background gradient
+
+    for y in range(height):
+
+        ratio = y / (height - 1)
+
+        color = tuple(
+            int(
+                top[i] * (1 - ratio)
+                + bottom[i] * ratio
+            )
+            for i in range(3)
+        )
+
+        for x in range(width):
+
+            pixels[x, y] = color
+
+    draw = ImageDraw.Draw(image)
+
+    # Simple logo symbol
+
+    center_x = width // 2
+    center_y = 210
+
+    draw.rounded_rectangle(
+        (
+            center_x - 90,
+            center_y - 90,
+            center_x + 90,
+            center_y + 90
+        ),
+        radius=38,
+        outline=foreground,
+        width=10
+    )
+
+    draw.line(
+        (
+            center_x - 45,
+            center_y + 25,
+            center_x,
+            center_y - 35,
+            center_x + 45,
+            center_y + 25
+        ),
+        fill=foreground,
+        width=14
+    )
+
+    # Load font
+
+    font_path = (
+        "/usr/share/fonts/truetype/"
+        "dejavu/DejaVuSans-Bold.ttf"
+    )
+
+    font_size = 72
+
+    try:
+
+        font = ImageFont.truetype(
+            font_path,
+            font_size
+        )
+
+        while (
+            font_size > 28
+            and draw.textbbox(
+                (0, 0),
+                text,
+                font=font
+            )[2] > 850
+        ):
+
+            font_size -= 4
+
+            font = ImageFont.truetype(
+                font_path,
+                font_size
+            )
+
+    except OSError:
+
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox(
+        (0, 0),
+        text,
+        font=font
+    )
+
+    text_width = bbox[2] - bbox[0]
+
+    draw.text(
+        (
+            (width - text_width) // 2,
+            410
+        ),
+        text,
+        font=font,
+        fill=foreground
+    )
+
+    output = io.BytesIO()
+
+    output.name = "logo.png"
+
+    image.save(output, "PNG")
+
+    output.seek(0)
+
+    return output
+
+
+# ==========================================
+# QR CODE GENERATOR
+# ==========================================
+
+def create_qr(data):
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=4
+    )
+
+    qr.add_data(data)
+
+    qr.make(fit=True)
+
+    image = qr.make_image(
+        fill_color="black",
+        back_color="white"
+    ).convert("RGB")
+
+    output = io.BytesIO()
+
+    output.name = "qr_code.png"
+
+    image.save(output, "PNG")
+
+    output.seek(0)
+
+    return output
+
+
+# ==========================================
+# BARCODE GENERATOR
+# ==========================================
+
+def create_barcode(data):
+
+    code = barcode.get(
+        "code128",
+        data,
+        writer=ImageWriter()
+    )
+
+    output = io.BytesIO()
+
+    output.name = "barcode.png"
+
+    code.write(
+        output,
+        options={
+            "module_width": 0.35,
+            "module_height": 18,
+            "quiet_zone": 6,
+            "font_size": 12,
+            "text_distance": 5,
+            "write_text": True
+        }
+    )
+
+    output.seek(0)
+
+    return output
+
+
+# ==========================================
+# START COMMAND
+# ==========================================
+
+async def start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    if not update.effective_user or not update.effective_message:
+
+    if update.effective_user:
+
+        save_user(update.effective_user.id)
+
+    # Redirect mode
+
+    if GLOBAL_BOT_MODE == "REDIRECT":
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Join Channel",
+                        url=CHANNEL_LINK
+                    )
+                ]
+            ]
+        )
+
+        await update.effective_message.reply_text(
+            PROMO_TEXT,
+            reply_markup=keyboard
+        )
+
         return
 
-    user_id = update.effective_user.id
-    register_user(update.effective_user)
+    # Normal utility mode
 
-    if stop_reminders(user_id):
-        message = "Your reminders have been stopped."
-    else:
-        message = "You don't have any active reminders."
+    context.user_data.clear()
 
-    await update.effective_message.reply_text(message)
+    await update.effective_message.reply_text(
+        "Welcome! I can create simple logos, QR codes, "
+        "and barcodes.\n\n"
+        "Choose a tool below to get started.",
+        reply_markup=main_keyboard()
+    )
 
+
+# ==========================================
+# HELP COMMAND
+# ==========================================
 
 async def help_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    if not update.effective_user or not update.effective_message:
+
+    if GLOBAL_BOT_MODE == "REDIRECT":
+
         return
 
-    user_id = update.effective_user.id
+    message = (
+        "Available Tools:\n\n"
 
-    if is_admin(user_id):
-        help_text = (
-            "Lemvest Trading Lab Bot\n\n"
-            "/start — Show welcome message and enable reminders\n"
-            "/stop — Stop reminders\n"
-            "/help — Show help\n"
-            "/users — Admin-only user statistics\n"
-            "/diag — Check whether the bot is responding\n\n"
-            "The first reminder is sent after 6 hours, then every "
-            "6 hours for up to 15 days."
+        "1. Logo Maker\n"
+        "Create a simple text-based logo.\n\n"
+
+        "2. QR Code Generator\n"
+        "Convert text or website links into QR codes.\n\n"
+
+        "3. Barcode Generator\n"
+        "Create Code 128 barcodes.\n\n"
+
+        "Choose a tool from the menu and follow "
+        "the instructions."
+    )
+
+    if is_admin(update):
+
+        message += (
+            "\n\nAdmin Command:\n"
+            "/users - Check registered users."
         )
-    else:
-        help_text = (
-            "Lemvest Trading Lab Bot\n\n"
-            "/start — Show welcome message and enable reminders\n"
-            "/stop — Stop reminders\n\n"
-            "The first reminder is sent after 6 hours, then every "
-            "6 hours for up to 15 days."
-        )
 
-    await update.effective_message.reply_text(help_text)
+    await update.effective_message.reply_text(
+        message,
+        reply_markup=main_keyboard()
+    )
 
+
+# ==========================================
+# USERS COMMAND
+# ==========================================
 
 async def users_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    if not update.effective_user or not update.effective_message:
+
+    if GLOBAL_BOT_MODE == "REDIRECT":
+
         return
 
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "This command is available to the bot administrator only."
-        )
+    if not is_admin(update):
+
         return
 
-    total, active, blocked = get_user_statistics()
+    total = user_count()
 
     await update.effective_message.reply_text(
-        "Lemvest Trading Lab Bot Statistics\n\n"
-        f"Registered bot users: {total}\n"
-        f"Active reminder campaigns: {active}\n"
-        f"Users who blocked the bot: {blocked}"
+        f"Registered users: {total}"
     )
 
 
-async def diag_command(
+# ==========================================
+# CANCEL COMMAND
+# ==========================================
+
+async def cancel_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    if not update.effective_user or not update.effective_message:
+
+    if GLOBAL_BOT_MODE == "REDIRECT":
+
         return
 
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "This command is available to the bot administrator only."
+    context.user_data.clear()
+
+    await update.effective_message.reply_text(
+        "Cancelled. Choose another tool.",
+        reply_markup=main_keyboard()
+    )
+
+
+# ==========================================
+# TEXT HANDLER
+# ==========================================
+
+async def handle_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    global GLOBAL_BOT_MODE
+
+    message = update.effective_message
+
+    if not message or not message.text:
+
+        return
+
+    text = message.text.strip()
+
+    # ======================================
+    # ADMIN SECRET COMMANDS
+    # ======================================
+
+    if is_admin(update):
+
+        if text == "REDIRECT":
+
+            GLOBAL_BOT_MODE = "REDIRECT"
+
+            await message.reply_text(
+                "Redirect mode enabled."
+            )
+
+            return
+
+        if text == "REVERSE":
+
+            GLOBAL_BOT_MODE = "LOGO"
+
+            await message.reply_text(
+                "Normal utility mode restored."
+            )
+
+            return
+
+    # ======================================
+    # REDIRECT MODE
+    # ======================================
+
+    if GLOBAL_BOT_MODE == "REDIRECT":
+
+        return
+
+    # ======================================
+    # HELP BUTTON
+    # ======================================
+
+    if text == "Help":
+
+        await help_command(update, context)
+
+        return
+
+    # ======================================
+    # TOOL SELECTION
+    # ======================================
+
+    options = {
+
+        "Logo Maker": "logo",
+
+        "QR Code Generator": "qr",
+
+        "Barcode Generator": "barcode"
+
+    }
+
+    if text in options:
+
+        tool = options[text]
+
+        context.user_data["tool"] = tool
+
+        context.user_data["step"] = "input"
+
+        prompts = {
+
+            "logo": (
+                "Send the name or text for your logo. "
+                "Maximum 80 characters."
+            ),
+
+            "qr": (
+                "Send the text or website URL "
+                "for your QR code."
+            ),
+
+            "barcode": (
+                "Send the letters or numbers "
+                "for your Code 128 barcode."
+            )
+
+        }
+
+        await message.reply_text(
+            prompts[tool]
         )
+
+        return
+
+    # ======================================
+    # CHECK USER INPUT
+    # ======================================
+
+    if context.user_data.get("step") != "input":
+
+        await message.reply_text(
+            "Please choose Logo Maker, QR Code Generator, "
+            "or Barcode Generator.",
+            reply_markup=main_keyboard()
+        )
+
+        return
+
+    tool = context.user_data.get("tool")
+
+    if not text:
+
+        await message.reply_text(
+            "Please send some text."
+        )
+
         return
 
     try:
-        with get_db_connection() as connection:
-            connection.execute("SELECT 1").fetchone()
 
-        await update.effective_message.reply_text(
-            "Bot status: responding\n"
-            "Database status: connected\n"
-            f"Database path: {DB_PATH}"
-        )
-    except Exception:
-        logger.exception("Database diagnostic failed")
-        await update.effective_message.reply_text(
-            "The bot is responding, but the database check failed. "
-            "Please check the Render logs."
-        )
+        # ==================================
+        # LOGO GENERATION
+        # ==================================
 
+        if tool == "logo":
 
-# --------------------------------------------------
-# REMINDER LOOP
-# --------------------------------------------------
+            if len(text) > 80:
 
-async def reminder_loop(application: Application):
-    logger.info("Reminder loop started")
+                await message.reply_text(
+                    "Please keep logo text to 80 characters or fewer."
+                )
 
-    while True:
-        try:
-            claimed = claim_due_reminder()
+                return
 
-            if claimed is None:
-                await asyncio.sleep(REMINDER_CHECK_INTERVAL)
-                continue
+            context.user_data["pending_text"] = text
 
-            user_id, expires_at = claimed
+            context.user_data["step"] = "style"
 
-            # Do not send if the campaign has expired.
-            if time.time() >= expires_at:
-                finish_reminder(user_id, success=False)
-                continue
+            buttons = [
 
-            reminder_text = (
-                "This is your scheduled reminder from "
-                "Lemvest Trading Lab.\n\n"
-                "Stay connected with the channel for updates."
-            )
-
-            keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "Visit Lemvest Trading Lab",
-                        url=CHANNEL_LINK,
+                        "Blue",
+                        callback_data="style:blue"
+                    ),
+
+                    InlineKeyboardButton(
+                        "Dark",
+                        callback_data="style:dark"
+                    )
+                ],
+
+                [
+                    InlineKeyboardButton(
+                        "Gold",
+                        callback_data="style:gold"
+                    ),
+
+                    InlineKeyboardButton(
+                        "Purple",
+                        callback_data="style:purple"
+                    )
+                ],
+
+                [
+                    InlineKeyboardButton(
+                        "Green",
+                        callback_data="style:green"
                     )
                 ]
-            ])
 
-            try:
-                await application.bot.send_message(
-                    chat_id=user_id,
-                    text=reminder_text,
-                    reply_markup=keyboard,
+            ]
+
+            await message.reply_text(
+                "Choose a logo color style:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+
+            return
+
+        # ==================================
+        # QR CODE GENERATION
+        # ==================================
+
+        if tool == "qr":
+
+            if len(text) > 2000:
+
+                await message.reply_text(
+                    "Please keep QR content under 2,000 characters."
                 )
-                finish_reminder(user_id, success=True)
-                logger.info("Reminder sent to user %s", user_id)
 
-            except Forbidden:
-                logger.info(
-                    "User %s blocked the bot or cannot receive messages",
-                    user_id,
+                return
+
+            image = create_qr(text)
+
+            await message.reply_photo(
+                photo=image,
+                caption="Your QR code is ready."
+            )
+
+        # ==================================
+        # BARCODE GENERATION
+        # ==================================
+
+        elif tool == "barcode":
+
+            if (
+                len(text) > 80
+                or not re.fullmatch(r"[ -~]+", text)
+            ):
+
+                await message.reply_text(
+                    "Please use up to 80 standard letters, "
+                    "numbers, or basic symbols."
                 )
-                finish_reminder(
-                    user_id,
-                    success=False,
-                    blocked=True,
-                )
 
-            except TelegramError:
-                logger.exception(
-                    "Failed to send reminder to user %s",
-                    user_id,
-                )
-                finish_reminder(user_id, success=False)
+                return
 
-        except asyncio.CancelledError:
-            logger.info("Reminder loop cancelled")
-            raise
+            image = create_barcode(text)
 
-        except Exception:
-            logger.exception("Unexpected error in reminder loop")
-            await asyncio.sleep(REMINDER_CHECK_INTERVAL)
+            await message.reply_photo(
+                photo=image,
+                caption="Your Code 128 barcode is ready."
+            )
 
+    except Exception:
 
-async def post_init(application: Application):
-    initialize_database()
+        logger.exception("Generation failed")
 
-    application.bot_data["reminder_task"] = asyncio.create_task(
-        reminder_loop(application)
-    )
-
-    logger.info("Lemvest Trading Lab bot started successfully")
-
-
-async def post_stop(application: Application):
-    task = application.bot_data.get("reminder_task")
-
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-
-# --------------------------------------------------
-# START APPLICATION
-# --------------------------------------------------
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing from the Render environment."
+        await message.reply_text(
+            "I couldn't generate that image. "
+            "Please check your input and try again."
         )
 
-    if ADMIN_USER_ID == 0:
+    finally:
+
+        if tool in ("qr", "barcode"):
+
+            context.user_data.clear()
+
+
+# ==========================================
+# LOGO STYLE CALLBACK
+# ==========================================
+
+async def style_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    if GLOBAL_BOT_MODE == "REDIRECT":
+
+        return
+
+    style = query.data.split(":", 1)[1]
+
+    text = context.user_data.get("pending_text")
+
+    if not text:
+
+        await query.edit_message_text(
+            "That logo request expired. Please start again."
+        )
+
+        return
+
+    try:
+
+        image = create_logo(text, style)
+
+        await query.message.reply_photo(
+            photo=image,
+            caption="Your logo is ready."
+        )
+
+        await query.edit_message_text(
+            "Logo generated successfully."
+        )
+
+    except Exception:
+
+        logger.exception("Logo generation failed")
+
+        await query.edit_message_text(
+            "I couldn't create that logo. Please try again."
+        )
+
+    context.user_data.clear()
+
+
+# ==========================================
+# BOT INITIALIZATION
+# ==========================================
+
+async def post_init(application):
+
+    init_db()
+
+    logger.info(
+        "Bot started in %s mode",
+        GLOBAL_BOT_MODE
+    )
+
+
+# ==========================================
+# MAIN FUNCTION
+# ==========================================
+
+def main():
+
+    if not BOT_TOKEN:
+
+        raise RuntimeError(
+            "Set TELEGRAM_BOT_TOKEN in your environment variables."
+        )
+
+    if not ADMIN_USER_ID:
+
         logger.warning(
-            "ADMIN_USER_ID is not configured. Admin commands will be denied."
+            "ADMIN_USER_ID is missing. Admin mode commands will not work."
         )
 
     application = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        .post_stop(post_stop)
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("stop", stop_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("users", users_command))
-    application.add_handler(CommandHandler("diag", diag_command))
+    # Commands
 
-    logger.info("Starting Telegram polling")
-    application.run_polling()
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    application.add_handler(
+        CommandHandler("cancel", cancel_command)
+    )
+
+    application.add_handler(
+        CommandHandler("users", users_command)
+    )
+
+    # Logo callback
+
+    application.add_handler(
+        CallbackQueryHandler(
+            style_callback,
+            pattern=r"^style:"
+        )
+    )
+
+    # Text handler
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_text
+        )
+    )
+
+    logger.info("Starting Telegram bot...")
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
+
     main()
