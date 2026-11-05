@@ -29,9 +29,9 @@ from telegram.ext import (
 )
 
 
-# ==========================================
+# =========================================
 # CONFIGURATION
-# ==========================================
+# =========================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
@@ -49,15 +49,11 @@ PROMO_TEXT = os.getenv(
 
 DB_PATH = os.getenv("DB_PATH", "users.db")
 
-# LOGO = Normal utility mode
-# REDIRECT = Promotional mode
+# SOFTWARE = Logo, QR and Barcode tools
+# REDIRECT = Original promotional bot
 
-GLOBAL_BOT_MODE = "LOGO"
+GLOBAL_BOT_MODE = "SOFTWARE"
 
-
-# ==========================================
-# LOGGING
-# ==========================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,9 +63,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ==========================================
+# =========================================
 # DATABASE
-# ==========================================
+# =========================================
 
 def init_db():
 
@@ -104,11 +100,9 @@ def user_count():
 
     with sqlite3.connect(DB_PATH) as conn:
 
-        result = conn.execute(
+        return conn.execute(
             "SELECT COUNT(*) FROM users"
-        ).fetchone()
-
-        return result[0]
+        ).fetchone()[0]
 
 
 def is_admin(update):
@@ -120,9 +114,9 @@ def is_admin(update):
     )
 
 
-# ==========================================
-# MAIN MENU
-# ==========================================
+# =========================================
+# SOFTWARE MENU
+# =========================================
 
 def main_keyboard():
 
@@ -141,9 +135,9 @@ def main_keyboard():
     )
 
 
-# ==========================================
+# =========================================
 # LOGO GENERATOR
-# ==========================================
+# =========================================
 
 def create_logo(text, style):
 
@@ -181,19 +175,13 @@ def create_logo(text, style):
 
     }
 
-    top, bottom, foreground = palettes.get(
-        style,
-        palettes["blue"]
-    )
+    top, bottom, foreground = palettes[style]
 
-    width = 1000
-    height = 600
+    width, height = 1000, 600
 
     image = Image.new("RGB", (width, height))
 
     pixels = image.load()
-
-    # Background gradient
 
     for y in range(height):
 
@@ -208,12 +196,9 @@ def create_logo(text, style):
         )
 
         for x in range(width):
-
             pixels[x, y] = color
 
     draw = ImageDraw.Draw(image)
-
-    # Simple logo symbol
 
     center_x = width // 2
     center_y = 210
@@ -243,8 +228,6 @@ def create_logo(text, style):
         width=14
     )
 
-    # Load font
-
     font_path = (
         "/usr/share/fonts/truetype/"
         "dejavu/DejaVuSans-Bold.ttf"
@@ -254,44 +237,29 @@ def create_logo(text, style):
 
     try:
 
-        font = ImageFont.truetype(
-            font_path,
-            font_size
-        )
+        font = ImageFont.truetype(font_path, font_size)
 
-        while (
-            font_size > 28
-            and draw.textbbox(
-                (0, 0),
-                text,
-                font=font
-            )[2] > 850
-        ):
+        while font_size > 28:
+
+            bbox = draw.textbbox((0, 0), text, font=font)
+
+            if bbox[2] <= 850:
+                break
 
             font_size -= 4
 
-            font = ImageFont.truetype(
-                font_path,
-                font_size
-            )
+            font = ImageFont.truetype(font_path, font_size)
 
     except OSError:
 
         font = ImageFont.load_default()
 
-    bbox = draw.textbbox(
-        (0, 0),
-        text,
-        font=font
-    )
+    bbox = draw.textbbox((0, 0), text, font=font)
 
     text_width = bbox[2] - bbox[0]
 
     draw.text(
-        (
-            (width - text_width) // 2,
-            410
-        ),
+        ((width - text_width) // 2, 410),
         text,
         font=font,
         fill=foreground
@@ -308,9 +276,9 @@ def create_logo(text, style):
     return output
 
 
-# ==========================================
+# =========================================
 # QR CODE GENERATOR
-# ==========================================
+# =========================================
 
 def create_qr(data):
 
@@ -341,9 +309,9 @@ def create_qr(data):
     return output
 
 
-# ==========================================
+# =========================================
 # BARCODE GENERATOR
-# ==========================================
+# =========================================
 
 def create_barcode(data):
 
@@ -374,162 +342,131 @@ def create_barcode(data):
     return output
 
 
-# ==========================================
-# START COMMAND
-# ==========================================
+# =========================================
+# REDIRECT MODE: ORIGINAL BOT
+# =========================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def redirect_start(update, context):
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Join Channel",
+                    url=CHANNEL_LINK
+                )
+            ]
+        ]
+    )
+
+    await update.effective_message.reply_text(
+        PROMO_TEXT,
+        reply_markup=keyboard
+    )
+
+
+# =========================================
+# START COMMAND
+# =========================================
+
+async def start(update, context):
 
     if update.effective_user:
-
         save_user(update.effective_user.id)
-
-    # Redirect mode
 
     if GLOBAL_BOT_MODE == "REDIRECT":
 
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "Join Channel",
-                        url=CHANNEL_LINK
-                    )
-                ]
-            ]
-        )
-
-        await update.effective_message.reply_text(
-            PROMO_TEXT,
-            reply_markup=keyboard
-        )
+        await redirect_start(update, context)
 
         return
-
-    # Normal utility mode
 
     context.user_data.clear()
 
     await update.effective_message.reply_text(
-        "Welcome! I can create simple logos, QR codes, "
-        "and barcodes.\n\n"
-        "Choose a tool below to get started.",
+        "Welcome! Choose a software tool below:",
         reply_markup=main_keyboard()
     )
 
 
-# ==========================================
+# =========================================
 # HELP COMMAND
-# ==========================================
+# =========================================
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def help_command(update, context):
 
     if GLOBAL_BOT_MODE == "REDIRECT":
-
         return
 
-    message = (
-        "Available Tools:\n\n"
-
-        "1. Logo Maker\n"
-        "Create a simple text-based logo.\n\n"
-
-        "2. QR Code Generator\n"
-        "Convert text or website links into QR codes.\n\n"
-
-        "3. Barcode Generator\n"
-        "Create Code 128 barcodes.\n\n"
-
-        "Choose a tool from the menu and follow "
-        "the instructions."
+    text = (
+        "Available Software Tools:\n\n"
+        "Logo Maker - Create text-based logos.\n\n"
+        "QR Code Generator - Generate QR codes.\n\n"
+        "Barcode Generator - Generate Code 128 barcodes.\n\n"
+        "Use /cancel to cancel an operation."
     )
 
     if is_admin(update):
 
-        message += (
-            "\n\nAdmin Command:\n"
-            "/users - Check registered users."
-        )
+        text += "\n\nAdmin command: /users"
 
     await update.effective_message.reply_text(
-        message,
+        text,
         reply_markup=main_keyboard()
     )
 
 
-# ==========================================
+# =========================================
 # USERS COMMAND
-# ==========================================
+# =========================================
 
-async def users_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def users_command(update, context):
 
     if GLOBAL_BOT_MODE == "REDIRECT":
-
         return
 
     if not is_admin(update):
-
         return
 
-    total = user_count()
-
     await update.effective_message.reply_text(
-        f"Registered users: {total}"
+        f"Registered users: {user_count()}"
     )
 
 
-# ==========================================
+# =========================================
 # CANCEL COMMAND
-# ==========================================
+# =========================================
 
-async def cancel_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def cancel_command(update, context):
 
     if GLOBAL_BOT_MODE == "REDIRECT":
-
         return
 
     context.user_data.clear()
 
     await update.effective_message.reply_text(
-        "Cancelled. Choose another tool.",
+        "Operation cancelled.",
         reply_markup=main_keyboard()
     )
 
 
-# ==========================================
-# TEXT HANDLER
-# ==========================================
+# =========================================
+# MAIN TEXT HANDLER
+# =========================================
 
-async def handle_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def handle_text(update, context):
 
     global GLOBAL_BOT_MODE
 
     message = update.effective_message
 
     if not message or not message.text:
-
         return
 
     text = message.text.strip()
 
-    # ======================================
-    # ADMIN SECRET COMMANDS
-    # ======================================
+    # =====================================
+    # ADMIN MODE SWITCHING
+    # =====================================
 
     if is_admin(update):
 
@@ -537,33 +474,38 @@ async def handle_text(
 
             GLOBAL_BOT_MODE = "REDIRECT"
 
+            context.user_data.clear()
+
             await message.reply_text(
-                "Redirect mode enabled."
+                "Original promotional bot mode activated."
             )
 
             return
 
         if text == "REVERSE":
 
-            GLOBAL_BOT_MODE = "LOGO"
+            GLOBAL_BOT_MODE = "SOFTWARE"
+
+            context.user_data.clear()
 
             await message.reply_text(
-                "Normal utility mode restored."
+                "Software mode activated. "
+                "Logo Maker, QR Code Generator and Barcode Generator are now available.",
+                reply_markup=main_keyboard()
             )
 
             return
 
-    # ======================================
+    # =====================================
     # REDIRECT MODE
-    # ======================================
+    # =====================================
 
     if GLOBAL_BOT_MODE == "REDIRECT":
-
         return
 
-    # ======================================
+    # =====================================
     # HELP BUTTON
-    # ======================================
+    # =====================================
 
     if text == "Help":
 
@@ -571,11 +513,11 @@ async def handle_text(
 
         return
 
-    # ======================================
+    # =====================================
     # TOOL SELECTION
-    # ======================================
+    # =====================================
 
-    options = {
+    tools = {
 
         "Logo Maker": "logo",
 
@@ -585,9 +527,9 @@ async def handle_text(
 
     }
 
-    if text in options:
+    if text in tools:
 
-        tool = options[text]
+        tool = tools[text]
 
         context.user_data["tool"] = tool
 
@@ -595,38 +537,26 @@ async def handle_text(
 
         prompts = {
 
-            "logo": (
-                "Send the name or text for your logo. "
-                "Maximum 80 characters."
-            ),
+            "logo": "Send the text for your logo. Maximum 80 characters.",
 
-            "qr": (
-                "Send the text or website URL "
-                "for your QR code."
-            ),
+            "qr": "Send the text or website URL for your QR code.",
 
-            "barcode": (
-                "Send the letters or numbers "
-                "for your Code 128 barcode."
-            )
+            "barcode": "Send the letters or numbers for your barcode."
 
         }
 
-        await message.reply_text(
-            prompts[tool]
-        )
+        await message.reply_text(prompts[tool])
 
         return
 
-    # ======================================
-    # CHECK USER INPUT
-    # ======================================
+    # =====================================
+    # CHECK INPUT
+    # =====================================
 
     if context.user_data.get("step") != "input":
 
         await message.reply_text(
-            "Please choose Logo Maker, QR Code Generator, "
-            "or Barcode Generator.",
+            "Please select a tool from the menu.",
             reply_markup=main_keyboard()
         )
 
@@ -634,26 +564,16 @@ async def handle_text(
 
     tool = context.user_data.get("tool")
 
-    if not text:
-
-        await message.reply_text(
-            "Please send some text."
-        )
-
-        return
-
     try:
 
-        # ==================================
-        # LOGO GENERATION
-        # ==================================
+        # LOGO
 
         if tool == "logo":
 
             if len(text) > 80:
 
                 await message.reply_text(
-                    "Please keep logo text to 80 characters or fewer."
+                    "Maximum logo text length is 80 characters."
                 )
 
                 return
@@ -665,69 +585,46 @@ async def handle_text(
             buttons = [
 
                 [
-                    InlineKeyboardButton(
-                        "Blue",
-                        callback_data="style:blue"
-                    ),
-
-                    InlineKeyboardButton(
-                        "Dark",
-                        callback_data="style:dark"
-                    )
+                    InlineKeyboardButton("Blue", callback_data="style:blue"),
+                    InlineKeyboardButton("Dark", callback_data="style:dark")
                 ],
 
                 [
-                    InlineKeyboardButton(
-                        "Gold",
-                        callback_data="style:gold"
-                    ),
-
-                    InlineKeyboardButton(
-                        "Purple",
-                        callback_data="style:purple"
-                    )
+                    InlineKeyboardButton("Gold", callback_data="style:gold"),
+                    InlineKeyboardButton("Purple", callback_data="style:purple")
                 ],
 
                 [
-                    InlineKeyboardButton(
-                        "Green",
-                        callback_data="style:green"
-                    )
+                    InlineKeyboardButton("Green", callback_data="style:green")
                 ]
 
             ]
 
             await message.reply_text(
-                "Choose a logo color style:",
+                "Choose your logo color:",
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
 
             return
 
-        # ==================================
-        # QR CODE GENERATION
-        # ==================================
+        # QR CODE
 
-        if tool == "qr":
+        elif tool == "qr":
 
             if len(text) > 2000:
 
                 await message.reply_text(
-                    "Please keep QR content under 2,000 characters."
+                    "QR content must be under 2,000 characters."
                 )
 
                 return
 
-            image = create_qr(text)
-
             await message.reply_photo(
-                photo=image,
+                photo=create_qr(text),
                 caption="Your QR code is ready."
             )
 
-        # ==================================
-        # BARCODE GENERATION
-        # ==================================
+        # BARCODE
 
         elif tool == "barcode":
 
@@ -737,50 +634,41 @@ async def handle_text(
             ):
 
                 await message.reply_text(
-                    "Please use up to 80 standard letters, "
-                    "numbers, or basic symbols."
+                    "Use up to 80 standard letters, numbers or basic symbols."
                 )
 
                 return
 
-            image = create_barcode(text)
-
             await message.reply_photo(
-                photo=image,
-                caption="Your Code 128 barcode is ready."
+                photo=create_barcode(text),
+                caption="Your barcode is ready."
             )
 
     except Exception:
 
-        logger.exception("Generation failed")
+        logger.exception("Generation error")
 
         await message.reply_text(
-            "I couldn't generate that image. "
-            "Please check your input and try again."
+            "Unable to generate your image. Please try again."
         )
 
     finally:
 
         if tool in ("qr", "barcode"):
-
             context.user_data.clear()
 
 
-# ==========================================
+# =========================================
 # LOGO STYLE CALLBACK
-# ==========================================
+# =========================================
 
-async def style_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def style_callback(update, context):
 
     query = update.callback_query
 
     await query.answer()
 
     if GLOBAL_BOT_MODE == "REDIRECT":
-
         return
 
     style = query.data.split(":", 1)[1]
@@ -790,17 +678,15 @@ async def style_callback(
     if not text:
 
         await query.edit_message_text(
-            "That logo request expired. Please start again."
+            "Request expired. Please start again."
         )
 
         return
 
     try:
 
-        image = create_logo(text, style)
-
         await query.message.reply_photo(
-            photo=image,
+            photo=create_logo(text, style),
             caption="Your logo is ready."
         )
 
@@ -810,18 +696,18 @@ async def style_callback(
 
     except Exception:
 
-        logger.exception("Logo generation failed")
+        logger.exception("Logo generation error")
 
         await query.edit_message_text(
-            "I couldn't create that logo. Please try again."
+            "Unable to generate your logo."
         )
 
     context.user_data.clear()
 
 
-# ==========================================
-# BOT INITIALIZATION
-# ==========================================
+# =========================================
+# INITIALIZATION
+# =========================================
 
 async def post_init(application):
 
@@ -833,22 +719,22 @@ async def post_init(application):
     )
 
 
-# ==========================================
-# MAIN FUNCTION
-# ==========================================
+# =========================================
+# MAIN
+# =========================================
 
 def main():
 
     if not BOT_TOKEN:
 
         raise RuntimeError(
-            "Set TELEGRAM_BOT_TOKEN in your environment variables."
+            "TELEGRAM_BOT_TOKEN is missing."
         )
 
     if not ADMIN_USER_ID:
 
         logger.warning(
-            "ADMIN_USER_ID is missing. Admin mode commands will not work."
+            "ADMIN_USER_ID is missing."
         )
 
     application = (
@@ -857,8 +743,6 @@ def main():
         .post_init(post_init)
         .build()
     )
-
-    # Commands
 
     application.add_handler(
         CommandHandler("start", start)
@@ -876,8 +760,6 @@ def main():
         CommandHandler("users", users_command)
     )
 
-    # Logo callback
-
     application.add_handler(
         CallbackQueryHandler(
             style_callback,
@@ -885,16 +767,12 @@ def main():
         )
     )
 
-    # Text handler
-
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             handle_text
         )
     )
-
-    logger.info("Starting Telegram bot...")
 
     application.run_polling(
         drop_pending_updates=True
