@@ -1,49 +1,35 @@
-
-import asyncio
-import logging
 import os
+import uuid
+import logging
 import sqlite3
-import time
-from contextlib import suppress
+import asyncio
 from pathlib import Path
 
-import barcode
 import qrcode
+import barcode
 from barcode.writer import ImageWriter
 from PIL import Image, ImageDraw, ImageFont
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import (
-    BadRequest,
-    Forbidden,
-    NetworkError,
-    RetryAfter,
-    TelegramError,
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
-    ContextTypes,
+    CallbackQueryHandler,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
-# ============================================================
+# --------------------------------------------------
 # CONFIGURATION
-# ============================================================
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    level=logging.INFO,
-)
-
-logger = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-BASE_DIR = Path(__file__).resolve().parent
+# --------------------------------------------------
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 
 CHANNEL_LINK = os.getenv(
@@ -51,580 +37,441 @@ CHANNEL_LINK = os.getenv(
     "https://t.me/+CaYjuNbPEFA2NWU0"
 ).strip()
 
-IMAGE_PATH = Path(
-    os.getenv("WELCOME_IMAGE_PATH", str(BASE_DIR / "welcome.jpg"))
-).expanduser()
+PROMO_TEXT = os.getenv(
+    "PROMO_TEXT",
+    "Welcome!\n\n"
+    "Join our channel to receive updates and information.\n\n"
+    "Click the button below to join."
+)
 
-DB_FILE = os.getenv(
-    "DB_FILE",
-    str(BASE_DIR / "users.db")
-).strip()
+DB_PATH = os.getenv("DB_PATH", "/var/data/users.db")
 
-# Bot modes
+WELCOME_IMAGE = "welcome.jpg"
+
+DEFAULT_MODE = "REDIRECT"
+
 MODE_REDIRECT = "REDIRECT"
-MODE_SOFTWARE = "REVERSE"
+MODE_REVERSE = "REVERSE"
 
-# First mode when the database is created
-DEFAULT_MODE = MODE_REDIRECT
+BASE_DIR = Path(__file__).resolve().parent
 
-# Reminder settings
-REMINDER_INTERVAL = 6 * 60 * 60
-CAMPAIGN_DURATION = 15 * 24 * 60 * 60
-CHECK_INTERVAL = 60
-SEND_DELAY = 1
-
-WELCOME_TEXT = (
-    "Welcome to Lemvest Trading Lab!\n\n"
-    "Get updates, information and useful resources "
-    "from our Telegram channel.\n\n"
-    "Tap the button below to join our channel."
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 
-PROMO_TEXT = (
-    "Welcome to Lemvest Trading Lab!\n\n"
-    "Stay connected with our latest updates, information "
-    "and resources.\n\n"
-    "Tap the button below to visit our Telegram channel."
-)
-
-SOFTWARE_MENU_TEXT = (
-    "Welcome to the Software Tools Bot.\n\n"
-    "Choose a tool below:\n\n"
-    "1. Logo Maker\n"
-    "2. QR Code Generator\n"
-    "3. Barcode Generator"
-)
+logger = logging.getLogger(__name__)
 
 
-# ============================================================
+# --------------------------------------------------
 # DATABASE
-# ============================================================
+# Each Telegram user has their own independent mode.
+# --------------------------------------------------
 
-def connect_db():
-    connection = sqlite3.connect(DB_FILE, timeout=30)
-    connection.execute("PRAGMA busy_timeout = 30000")
+def get_connection():
+    db_file = Path(DB_PATH)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+
+    connection = sqlite3.connect(DB_PATH)
+    connection.execute("PRAGMA journal_mode=WAL")
     return connection
 
 
-def init_db():
-    Path(DB_FILE).expanduser().resolve().parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    with connect_db() as conn:
-
-        conn.execute("PRAGMA journal_mode=WAL")
-
-        conn.execute("""
+def init_database():
+    with get_connection() as connection:
+        connection.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                created_at REAL NOT NULL
+                first_seen TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                setting_key TEXT PRIMARY KEY,
-                setting_value TEXT NOT NULL
-            )
-        """)
-
-        conn.execute("""
-            INSERT OR IGNORE INTO settings
-            (setting_key, setting_value)
-            VALUES ('bot_mode', ?)
-        """, (DEFAULT_MODE,))
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS reminder_schedule (
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
                 user_id INTEGER PRIMARY KEY,
-                started_at REAL NOT NULL,
-                expires_at REAL NOT NULL,
-                next_send_at REAL NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1
+                mode TEXT NOT NULL DEFAULT 'REDIRECT'
             )
         """)
 
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_reminders_due
-            ON reminder_schedule(active, next_send_at, expires_at)
-        """)
-
-        conn.commit()
-
-    logger.info("Database initialized successfully.")
+        connection.commit()
 
 
-def register_user(user):
-    with connect_db() as conn:
-        conn.execute("""
-            INSERT INTO users (
-                user_id,
-                username,
-                first_name,
-                created_at
-            )
-            VALUES (?, ?, ?, ?)
+def register_user(user_id):
+    with get_connection() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+            (user_id,)
+        )
 
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name
-        """, (
-            user.id,
-            user.username,
-            user.first_name,
-            time.time()
-        ))
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO user_settings (user_id, mode)
+            VALUES (?, ?)
+            """,
+            (user_id, DEFAULT_MODE)
+        )
 
-        conn.commit()
+        connection.commit()
 
 
-def get_mode():
-    with connect_db() as conn:
-        result = conn.execute("""
-            SELECT setting_value
-            FROM settings
-            WHERE setting_key = 'bot_mode'
-        """).fetchone()
+def get_user_mode(user_id):
+    with get_connection() as connection:
+        result = connection.execute(
+            "SELECT mode FROM user_settings WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
 
-    if result and result[0] in (MODE_REDIRECT, MODE_SOFTWARE):
+    if result:
         return result[0]
 
     return DEFAULT_MODE
 
 
-def set_mode(mode):
-    if mode not in (MODE_REDIRECT, MODE_SOFTWARE):
-        raise ValueError("Invalid bot mode.")
+def set_user_mode(user_id, mode):
+    if mode not in (MODE_REDIRECT, MODE_REVERSE):
+        return
 
-    with connect_db() as conn:
-        conn.execute("""
-            INSERT INTO settings (
-                setting_key,
-                setting_value
-            )
-            VALUES ('bot_mode', ?)
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO user_settings (user_id, mode)
+            VALUES (?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET mode = excluded.mode
+            """,
+            (user_id, mode)
+        )
 
-            ON CONFLICT(setting_key)
-            DO UPDATE SET setting_value = excluded.setting_value
-        """, (mode,))
-
-        conn.commit()
+        connection.commit()
 
 
-def get_user_count():
-    with connect_db() as conn:
-        return conn.execute(
+def get_total_users():
+    with get_connection() as connection:
+        result = connection.execute(
             "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
+        ).fetchone()
+
+    return result[0] if result else 0
 
 
-# ============================================================
-# REMINDER DATABASE FUNCTIONS
-# ============================================================
+# --------------------------------------------------
+# KEYBOARD
+# Both mode buttons are always visible to every user.
+# --------------------------------------------------
 
-def start_reminders(user_id):
-    now = time.time()
-
-    with connect_db() as conn:
-
-        existing = conn.execute("""
-            SELECT active, expires_at
-            FROM reminder_schedule
-            WHERE user_id = ?
-        """, (user_id,)).fetchone()
-
-        if existing and existing[0] == 1 and existing[1] > now:
-            return False
-
-        conn.execute("""
-            INSERT INTO reminder_schedule (
-                user_id,
-                started_at,
-                expires_at,
-                next_send_at,
-                active
-            )
-            VALUES (?, ?, ?, ?, 1)
-
-            ON CONFLICT(user_id) DO UPDATE SET
-                started_at = excluded.started_at,
-                expires_at = excluded.expires_at,
-                next_send_at = excluded.next_send_at,
-                active = 1
-        """, (
-            user_id,
-            now,
-            now + CAMPAIGN_DURATION,
-            now + REMINDER_INTERVAL
-        ))
-
-        conn.commit()
-
-    return True
-
-
-def stop_reminders(user_id):
-    with connect_db() as conn:
-        conn.execute("""
-            UPDATE reminder_schedule
-            SET active = 0
-            WHERE user_id = ?
-        """, (user_id,))
-
-        conn.commit()
-
-
-def get_due_users():
-    now = time.time()
-
-    with connect_db() as conn:
-        results = conn.execute("""
-            SELECT user_id
-            FROM reminder_schedule
-            WHERE active = 1
-              AND next_send_at <= ?
-              AND expires_at > ?
-            ORDER BY next_send_at
-            LIMIT 50
-        """, (now, now)).fetchall()
-
-    return [row[0] for row in results]
-
-
-def postpone_reminder(user_id, seconds=REMINDER_INTERVAL):
-    now = time.time()
-
-    with connect_db() as conn:
-        conn.execute("""
-            UPDATE reminder_schedule
-            SET next_send_at = MIN(expires_at, ?)
-            WHERE user_id = ?
-              AND active = 1
-        """, (now + seconds, user_id))
-
-        conn.commit()
-
-
-# ============================================================
-# ADMIN CHECK
-# ============================================================
-
-def is_admin(user_id):
-    return (
-        ADMIN_USER_ID.isdigit()
-        and user_id == int(ADMIN_USER_ID)
-    )
-
-
-# ============================================================
-# BUTTONS
-# ============================================================
-
-def join_keyboard():
-    return InlineKeyboardMarkup([
+def build_keyboard(mode):
+    keyboard = [
         [
             InlineKeyboardButton(
-                "Join Channel",
-                url=CHANNEL_LINK
-            )
-        ]
-    ])
-
-
-def admin_redirect_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "Join Channel",
-                url=CHANNEL_LINK
-            )
-        ],
-        [
+                "REVERSE",
+                callback_data="mode:REVERSE"
+            ),
             InlineKeyboardButton(
                 "REDIRECT",
                 callback_data="mode:REDIRECT"
             ),
-            InlineKeyboardButton(
-                "REVERSE",
-                callback_data="mode:REVERSE"
-            )
-        ]
-    ])
-
-
-def software_keyboard(admin=False):
-
-    buttons = [
-        [
-            InlineKeyboardButton(
-                "Logo Maker",
-                callback_data="tool:logo"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "QR Code Generator",
-                callback_data="tool:qr"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "Barcode Generator",
-                callback_data="tool:barcode"
-            )
         ]
     ]
 
-    if admin:
-        buttons.append([
+    if mode == MODE_REVERSE:
+        keyboard.extend([
+            [
+                InlineKeyboardButton(
+                    "Logo Maker",
+                    callback_data="tool:logo"
+                ),
+                InlineKeyboardButton(
+                    "QR Code Generator",
+                    callback_data="tool:qr"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Barcode Generator",
+                    callback_data="tool:barcode"
+                ),
+            ],
+        ])
+
+    elif mode == MODE_REDIRECT:
+        keyboard.append([
             InlineKeyboardButton(
-                "REDIRECT",
-                callback_data="mode:REDIRECT"
-            ),
-            InlineKeyboardButton(
-                "REVERSE",
-                callback_data="mode:REVERSE"
+                "Join Channel",
+                url=CHANNEL_LINK
             )
         ])
 
-    return InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup(keyboard)
 
 
-# ============================================================
-# WELCOME IMAGE
-# ============================================================
+# --------------------------------------------------
+# WELCOME MENU
+# --------------------------------------------------
 
-async def send_photo_or_text(message, caption, keyboard):
+async def show_menu(chat_id, context, user_id):
+    mode = get_user_mode(user_id)
 
-    if IMAGE_PATH.is_file():
+    if mode == MODE_REVERSE:
+        caption = (
+            "Welcome!\n\n"
+            "Current mode: REVERSE\n\n"
+            "Choose one of the software tools below."
+        )
+    else:
+        caption = (
+            "Welcome!\n\n"
+            "Current mode: REDIRECT\n\n"
+            f"{PROMO_TEXT}"
+        )
 
-        try:
-            with IMAGE_PATH.open("rb") as photo:
+    keyboard = build_keyboard(mode)
 
-                await message.reply_photo(
+    image_path = BASE_DIR / WELCOME_IMAGE
+
+    try:
+        if image_path.exists():
+            with open(image_path, "rb") as photo:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
                     photo=photo,
                     caption=caption,
-                    reply_markup=keyboard
+                    reply_markup=keyboard,
                 )
-
-            return
-
-        except (BadRequest, OSError):
-            logger.exception("Unable to send welcome image.")
-
-    await message.reply_text(
-        caption,
-        reply_markup=keyboard,
-        disable_web_page_preview=True
-    )
-
-
-# ============================================================
-# SHOW CURRENT MODE
-# ============================================================
-
-async def show_active_screen(message, user_id):
-
-    mode = await asyncio.to_thread(get_mode)
-
-    admin = is_admin(user_id)
-
-    if admin:
-
-        if mode == MODE_REDIRECT:
-
-            caption = (
-                f"{WELCOME_TEXT}\n\n"
-                "ADMIN CONTROL PANEL\n\n"
-                "Current mode: REDIRECT\n\n"
-                "Choose REDIRECT or REVERSE below "
-                "to change the bot mode for everyone."
-            )
-
-            await send_photo_or_text(
-                message,
-                caption,
-                admin_redirect_keyboard()
-            )
-
         else:
-
-            caption = (
-                "Software mode is currently active.\n\n"
-                "Choose a software tool below.\n\n"
-                "You can switch modes using the buttons."
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=caption,
+                reply_markup=keyboard,
             )
 
-            await send_photo_or_text(
-                message,
-                caption,
-                software_keyboard(admin=True)
-            )
+    except Exception:
+        logger.exception("Could not send welcome image")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            reply_markup=keyboard,
+        )
 
+
+# --------------------------------------------------
+# START COMMAND
+# --------------------------------------------------
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+
+    if not user:
         return
 
-    # Normal users see only the active mode.
+    register_user(user.id)
 
-    if mode == MODE_REDIRECT:
+    # Each user keeps their own previously selected mode.
+    context.user_data.pop("awaiting_tool", None)
 
-        await send_photo_or_text(
-            message,
-            PROMO_TEXT,
-            join_keyboard()
-        )
-
-    else:
-
-        await message.reply_text(
-            SOFTWARE_MENU_TEXT,
-            reply_markup=software_keyboard()
-        )
-
-
-# ============================================================
-# LOGO MAKER
-# ============================================================
-
-def load_font(size, bold=False):
-
-    fonts = (
-        ["DejaVuSans-Bold.ttf", "arialbd.ttf"]
-        if bold
-        else ["DejaVuSans.ttf", "arial.ttf"]
+    await show_menu(
+        chat_id=update.effective_chat.id,
+        context=context,
+        user_id=user.id,
     )
 
-    for font_name in fonts:
 
-        try:
-            return ImageFont.truetype(
-                font_name,
-                size=size
-            )
+# --------------------------------------------------
+# MODE SWITCHING
+# This changes only the user who pressed the button.
+# --------------------------------------------------
 
-        except OSError:
-            continue
+async def mode_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    register_user(user_id)
+
+    selected_mode = query.data.split(":")[1]
+
+    if selected_mode not in (MODE_REDIRECT, MODE_REVERSE):
+        return
+
+    set_user_mode(user_id, selected_mode)
+
+    # Cancel any unfinished software tool request.
+    context.user_data.pop("awaiting_tool", None)
+
+    await show_menu(
+        chat_id=query.message.chat_id,
+        context=context,
+        user_id=user_id,
+    )
+
+
+# --------------------------------------------------
+# SOFTWARE TOOL BUTTONS
+# --------------------------------------------------
+
+async def tool_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    register_user(user_id)
+
+    current_mode = get_user_mode(user_id)
+
+    if current_mode != MODE_REVERSE:
+        await query.answer(
+            "Select REVERSE first to use the software tools.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
+    tool = query.data.split(":")[1]
+
+    tool_prompts = {
+        "logo": (
+            "LOGO MAKER\n\n"
+            "Send the name or text you want to use for your logo.\n\n"
+            "Send /cancel to cancel."
+        ),
+        "qr": (
+            "QR CODE GENERATOR\n\n"
+            "Send the text, website address or information "
+            "you want to convert into a QR code.\n\n"
+            "Send /cancel to cancel."
+        ),
+        "barcode": (
+            "BARCODE GENERATOR\n\n"
+            "Send the numbers or text you want to convert "
+            "into a barcode.\n\n"
+            "Send /cancel to cancel."
+        ),
+    }
+
+    if tool not in tool_prompts:
+        return
+
+    context.user_data["awaiting_tool"] = tool
+
+    await query.message.reply_text(tool_prompts[tool])
+
+
+# --------------------------------------------------
+# FONT HELPER
+# --------------------------------------------------
+
+def get_font(size):
+    possible_fonts = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+    ]
+
+    for font_path in possible_fonts:
+        if os.path.exists(font_path):
+            try:
+                return ImageFont.truetype(font_path, size)
+            except Exception:
+                pass
 
     return ImageFont.load_default()
 
 
-def create_logo(text_value):
+# --------------------------------------------------
+# LOGO MAKER
+# --------------------------------------------------
 
-    brand = " ".join(text_value.strip().split())[:28]
-
-    if not brand:
-        raise ValueError("Please enter a brand name.")
-
+def create_logo(text):
     image = Image.new(
         "RGB",
-        (1100, 650),
-        "#f4f6fa"
+        (1200, 630),
+        (248, 250, 252)
     )
 
     draw = ImageDraw.Draw(image)
 
     draw.rounded_rectangle(
-        (55, 55, 1045, 595),
-        radius=45,
-        fill="#ffffff",
-        outline="#dce2ec",
-        width=4
+        (45, 45, 1155, 585),
+        radius=35,
+        outline=(30, 50, 80),
+        width=5,
     )
 
-    draw.ellipse(
-        (425, 115, 675, 365),
-        fill="#172b4d"
+    draw.line(
+        (350, 210, 850, 210),
+        fill=(30, 100, 180),
+        width=5,
     )
 
-    draw.ellipse(
-        (485, 175, 615, 305),
-        fill="#ffffff"
+    draw.line(
+        (350, 425, 850, 425),
+        fill=(30, 100, 180),
+        width=5,
     )
 
-    draw.ellipse(
-        (520, 210, 580, 270),
-        fill="#2878d0"
-    )
+    display_text = text.strip()[:40]
 
-    font = load_font(68, bold=True)
+    font_size = 100
 
-    while True:
+    while font_size > 25:
+        font = get_font(font_size)
+        box = draw.textbbox((0, 0), display_text, font=font)
+        text_width = box[2] - box[0]
 
-        box = draw.textbbox(
-            (0, 0),
-            brand,
-            font=font
-        )
-
-        width = box[2] - box[0]
-
-        if width <= 900 or getattr(font, "size", 68) <= 28:
+        if text_width <= 950:
             break
 
-        font = load_font(
-            font.size - 4,
-            bold=True
-        )
+        font_size -= 5
 
-    x_position = (1100 - width) / 2
+    font = get_font(font_size)
+
+    box = draw.textbbox((0, 0), display_text, font=font)
+
+    text_width = box[2] - box[0]
+    text_height = box[3] - box[1]
+
+    x = (1200 - text_width) / 2
+    y = (315 - text_height) / 2 - box[1]
 
     draw.text(
-        (x_position, 420),
-        brand,
+        (x, y),
+        display_text,
+        fill=(20, 35, 60),
         font=font,
-        fill="#172b4d"
     )
 
-    tagline = "YOUR BRAND - YOUR IDENTITY"
-
-    tagline_font = load_font(24)
-
-    tagline_box = draw.textbbox(
-        (0, 0),
-        tagline,
-        font=tagline_font
+    output = os.path.join(
+        "/tmp",
+        f"logo_{uuid.uuid4().hex}.png"
     )
 
-    tagline_width = tagline_box[2] - tagline_box[0]
-
-    draw.text(
-        ((1100 - tagline_width) / 2, 520),
-        tagline,
-        font=tagline_font,
-        fill="#68758a"
-    )
-
-    output = BASE_DIR / "generated_logo.png"
-
-    image.save(output, format="PNG")
+    image.save(output)
 
     return output
 
 
-# ============================================================
+# --------------------------------------------------
 # QR CODE GENERATOR
-# ============================================================
+# --------------------------------------------------
 
-def create_qr(data):
-
-    value = data.strip()
-
-    if not value:
-        raise ValueError(
-            "Please send text or a website link."
-        )
-
+def create_qr_code(data):
     qr = qrcode.QRCode(
         version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=10,
-        border=4
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=12,
+        border=4,
     )
 
-    qr.add_data(value)
+    qr.add_data(data)
     qr.make(fit=True)
 
     image = qr.make_image(
@@ -632,653 +479,301 @@ def create_qr(data):
         back_color="white"
     ).convert("RGB")
 
-    output = BASE_DIR / "generated_qr.png"
+    output = os.path.join(
+        "/tmp",
+        f"qr_{uuid.uuid4().hex}.png"
+    )
 
     image.save(output)
 
     return output
 
 
-# ============================================================
+# --------------------------------------------------
 # BARCODE GENERATOR
-# ============================================================
+# --------------------------------------------------
 
 def create_barcode(data):
-
-    value = data.strip()
-
-    if not value:
-        raise ValueError(
-            "Please send text or numbers for the barcode."
-        )
-
-    if len(value) > 60:
-        raise ValueError(
-            "Please use 60 characters or fewer."
-        )
-
     barcode_class = barcode.get_barcode_class("code128")
 
-    code = barcode_class(
-        value,
+    barcode_object = barcode_class(
+        data,
         writer=ImageWriter()
     )
 
-    saved_path = code.save(
-        str(BASE_DIR / "generated_barcode")
+    output_base = os.path.join(
+        "/tmp",
+        f"barcode_{uuid.uuid4().hex}"
     )
 
-    return Path(saved_path)
-
-
-# ============================================================
-# START COMMAND
-# ============================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-    message = update.effective_message
-
-    if user is None or message is None:
-        return
-
-    if update.effective_chat.type != "private":
-
-        await message.reply_text(
-            "Please open this bot in a private chat and send /start."
-        )
-
-        return
-
-    context.user_data.pop("waiting_for", None)
-
-    await asyncio.to_thread(register_user, user)
-
-    mode = await asyncio.to_thread(get_mode)
-
-    if mode == MODE_REDIRECT and not is_admin(user.id):
-
-        await asyncio.to_thread(
-            start_reminders,
-            user.id
-        )
-
-    await show_active_screen(
-        message,
-        user.id
-    )
-
-
-# ============================================================
-# HELP COMMAND
-# ============================================================
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_message:
-
-        await update.effective_message.reply_text(
-            "/start - Open the current bot mode\n"
-            "/help - Show help information\n"
-            "/cancel - Cancel a software operation\n"
-            "/stop - Stop promotional reminders\n"
-            "/users - Admin-only user count"
-        )
-
-
-# ============================================================
-# CANCEL COMMAND
-# ============================================================
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    context.user_data.pop("waiting_for", None)
-
-    if update.effective_message:
-
-        await update.effective_message.reply_text(
-            "Your current operation has been cancelled."
-        )
-
-
-# ============================================================
-# STOP REMINDERS
-# ============================================================
-
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-    message = update.effective_message
-
-    if user is None or message is None:
-        return
-
-    await asyncio.to_thread(
-        stop_reminders,
-        user.id
-    )
-
-    await message.reply_text(
-        "Your promotional reminders have been stopped."
-    )
-
-
-# ============================================================
-# ADMIN USERS COMMAND
-# ============================================================
-
-async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-    message = update.effective_message
-
-    if user is None or message is None:
-        return
-
-    if not is_admin(user.id):
-
-        await message.reply_text(
-            "You are not authorized to use this command."
-        )
-
-        return
-
-    count = await asyncio.to_thread(get_user_count)
-
-    await message.reply_text(
-        f"Total recorded users: {count}"
-    )
-
-
-# ============================================================
-# BUTTON CALLBACK HANDLER
-# ============================================================
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    user = update.effective_user
-
-    if query is None or user is None:
-        return
-
-    data = query.data or ""
-
-    # --------------------------------------------------------
-    # ADMIN MODE SWITCHING
-    # --------------------------------------------------------
-
-    if data.startswith("mode:"):
-
-        if not is_admin(user.id):
-
-            await query.answer(
-                "Only the bot administrator can change modes.",
-                show_alert=True
-            )
-
-            return
-
-        new_mode = data.split(":", 1)[1]
-
-        if new_mode not in (MODE_REDIRECT, MODE_SOFTWARE):
-
-            await query.answer(
-                "Invalid mode.",
-                show_alert=True
-            )
-
-            return
-
-        await query.answer("Changing bot mode...")
-
-        await asyncio.to_thread(
-            set_mode,
-            new_mode
-        )
-
-        context.user_data.pop("waiting_for", None)
-
-        if new_mode == MODE_REDIRECT:
-
-            caption = (
-                f"{WELCOME_TEXT}\n\n"
-                "ADMIN CONTROL PANEL\n\n"
-                "Current mode: REDIRECT\n\n"
-                "All users now see the channel welcome screen."
-            )
-
-            keyboard = admin_redirect_keyboard()
-
-        else:
-
-            caption = (
-                "Software mode is now active for all users.\n\n"
-                "Choose a tool below or switch modes using "
-                "the admin buttons."
-            )
-
-            keyboard = software_keyboard(admin=True)
-
-        try:
-
-            if query.message and query.message.photo:
-
-                await query.edit_message_caption(
-                    caption=caption,
-                    reply_markup=keyboard
-                )
-
-            elif query.message:
-
-                await query.edit_message_text(
-                    text=caption,
-                    reply_markup=keyboard
-                )
-
-        except BadRequest:
-
-            logger.exception(
-                "Could not update admin control panel."
-            )
-
-        logger.info(
-            "Admin %s switched mode to %s",
-            user.id,
-            new_mode
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # SOFTWARE TOOL BUTTONS
-    # --------------------------------------------------------
-
-    if data.startswith("tool:"):
-
-        await query.answer()
-
-        mode = await asyncio.to_thread(get_mode)
-
-        if mode != MODE_SOFTWARE:
-
-            await query.answer(
-                "Software tools are currently unavailable.",
-                show_alert=True
-            )
-
-            return
-
-        tool = data.split(":", 1)[1]
-
-        prompts = {
-            "logo": (
-                "logo",
-                "Send the brand or business name for your logo."
-            ),
-
-            "qr": (
-                "qr",
-                "Send the text or website link for your QR code."
-            ),
-
-            "barcode": (
-                "barcode",
-                "Send the text or numbers for your barcode."
-            )
+    output = barcode_object.save(
+        output_base,
+        options={
+            "write_text": True,
+            "module_height": 15.0,
+            "module_width": 0.3,
         }
+    )
 
-        if tool not in prompts:
-            return
+    return output
 
-        context.user_data["waiting_for"] = prompts[tool][0]
 
-        await query.message.reply_text(
-            prompts[tool][1]
+# --------------------------------------------------
+# TOOL INPUT HANDLER
+# --------------------------------------------------
+
+async def handle_tool_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not update.message or not update.message.text:
+        return
+
+    user_id = update.effective_user.id
+
+    tool = context.user_data.get("awaiting_tool")
+
+    if not tool:
+        return
+
+    # Check the user's mode again before generating anything.
+    if get_user_mode(user_id) != MODE_REVERSE:
+        context.user_data.pop("awaiting_tool", None)
+        await update.message.reply_text(
+            "Your current mode is REDIRECT. Select REVERSE "
+            "to use the software tools."
         )
-
-
-# ============================================================
-# SOFTWARE TEXT INPUT
-# ============================================================
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-    message = update.effective_message
-
-    if user is None or message is None or not message.text:
         return
 
-    mode = await asyncio.to_thread(get_mode)
+    data = update.message.text.strip()
 
-    # Ignore software inputs in REDIRECT mode.
-    if mode != MODE_SOFTWARE:
+    if not data:
+        await update.message.reply_text("Please send valid text.")
         return
 
-    task = context.user_data.get("waiting_for")
-
-    if not task:
-
-        await message.reply_text(
-            "Please choose a software tool below.",
-            reply_markup=software_keyboard(
-                admin=is_admin(user.id)
-            )
-        )
-
-        return
+    output_path = None
 
     try:
+        if tool == "logo":
+            if len(data) > 40:
+                await update.message.reply_text(
+                    "Please use a name or text with no more than 40 characters."
+                )
+                return
 
-        if task == "logo":
-
-            output = await asyncio.to_thread(
+            output_path = await asyncio.to_thread(
                 create_logo,
-                message.text
+                data
             )
 
-            caption = "Your logo is ready."
+            caption = "Your logo has been created."
 
-        elif task == "qr":
+        elif tool == "qr":
+            if len(data) > 2000:
+                await update.message.reply_text(
+                    "Please keep the QR code content below 2,000 characters."
+                )
+                return
 
-            output = await asyncio.to_thread(
-                create_qr,
-                message.text
+            output_path = await asyncio.to_thread(
+                create_qr_code,
+                data
             )
 
-            caption = "Your QR code is ready."
+            caption = "Your QR code has been created."
 
-        elif task == "barcode":
+        elif tool == "barcode":
+            if len(data) > 80:
+                await update.message.reply_text(
+                    "Please keep the barcode content below 80 characters."
+                )
+                return
 
-            output = await asyncio.to_thread(
+            try:
+                data.encode("ascii")
+            except UnicodeEncodeError:
+                await update.message.reply_text(
+                    "Please use standard English letters and numbers "
+                    "for barcode generation."
+                )
+                return
+
+            output_path = await asyncio.to_thread(
                 create_barcode,
-                message.text
+                data
             )
 
-            caption = "Your barcode is ready."
+            caption = "Your barcode has been created."
 
         else:
-
-            context.user_data.pop("waiting_for", None)
-
-            await message.reply_text(
-                "Please select a tool again."
-            )
-
+            context.user_data.pop("awaiting_tool", None)
             return
 
-        with output.open("rb") as file_obj:
-
-            await message.reply_document(
-                document=file_obj,
-                caption=caption
+        with open(output_path, "rb") as document:
+            await update.message.reply_document(
+                document=document,
+                filename=os.path.basename(output_path),
+                caption=caption,
             )
 
-        context.user_data.pop("waiting_for", None)
+        context.user_data.pop("awaiting_tool", None)
 
-        await message.reply_text(
-            "Choose another tool:",
-            reply_markup=software_keyboard(
-                admin=is_admin(user.id)
-            )
+        await update.message.reply_text(
+            "You can select another software tool below.",
+            reply_markup=build_keyboard(MODE_REVERSE),
         )
-
-    except (ValueError, OSError) as exc:
-
-        await message.reply_text(str(exc))
 
     except Exception:
+        logger.exception("Tool generation failed")
 
-        logger.exception(
-            "Software generation failed for user %s",
-            user.id
+        await update.message.reply_text(
+            "Something went wrong while creating your file. "
+            "Please try again."
         )
 
-        await message.reply_text(
-            "Sorry, something went wrong. Please try again."
-        )
+    finally:
+        if output_path and os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
 
 
-# ============================================================
-# PROMOTIONAL REMINDER SENDER
-# ============================================================
+# --------------------------------------------------
+# CANCEL COMMAND
+# --------------------------------------------------
 
-async def send_reminder(application: Application, user_id: int):
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    context.user_data.pop("awaiting_tool", None)
 
-    keyboard = join_keyboard()
-
-    if IMAGE_PATH.is_file():
-
-        try:
-
-            with IMAGE_PATH.open("rb") as photo:
-
-                await application.bot.send_photo(
-                    chat_id=user_id,
-                    photo=photo,
-                    caption=PROMO_TEXT,
-                    reply_markup=keyboard
-                )
-
-            return
-
-        except (BadRequest, OSError):
-
-            logger.exception(
-                "Could not send reminder image to %s",
-                user_id
-            )
-
-    await application.bot.send_message(
-        chat_id=user_id,
-        text=PROMO_TEXT,
-        reply_markup=keyboard,
-        disable_web_page_preview=True
+    await update.message.reply_text(
+        "The current operation has been cancelled.",
+        reply_markup=build_keyboard(
+            get_user_mode(update.effective_user.id)
+        ),
     )
 
 
-# ============================================================
-# BACKGROUND REMINDER WORKER
-# ============================================================
+# --------------------------------------------------
+# HOME COMMAND
+# --------------------------------------------------
 
-async def reminder_loop(application: Application):
+async def home_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user_id = update.effective_user.id
 
-    logger.info("Reminder worker started.")
+    register_user(user_id)
+    context.user_data.pop("awaiting_tool", None)
 
-    while True:
-
-        try:
-
-            mode = await asyncio.to_thread(get_mode)
-
-            users = await asyncio.to_thread(get_due_users)
-
-            for user_id in users:
-
-                if mode != MODE_REDIRECT:
-
-                    await asyncio.to_thread(
-                        postpone_reminder,
-                        user_id,
-                        30 * 60
-                    )
-
-                    continue
-
-                try:
-
-                    await send_reminder(
-                        application,
-                        user_id
-                    )
-
-                    await asyncio.to_thread(
-                        postpone_reminder,
-                        user_id,
-                        REMINDER_INTERVAL
-                    )
-
-                    logger.info(
-                        "Reminder sent to %s",
-                        user_id
-                    )
-
-                except Forbidden:
-
-                    await asyncio.to_thread(
-                        stop_reminders,
-                        user_id
-                    )
-
-                    logger.info(
-                        "Reminders stopped for blocked user %s",
-                        user_id
-                    )
-
-                except RetryAfter as exc:
-
-                    delay = exc.retry_after
-
-                    if hasattr(delay, "total_seconds"):
-                        delay = delay.total_seconds()
-
-                    delay = float(delay)
-
-                    await asyncio.to_thread(
-                        postpone_reminder,
-                        user_id,
-                        delay + 5
-                    )
-
-                    await asyncio.sleep(delay + 1)
-
-                    break
-
-                except (NetworkError, TelegramError):
-
-                    logger.exception(
-                        "Telegram error sending to %s",
-                        user_id
-                    )
-
-                    await asyncio.to_thread(
-                        postpone_reminder,
-                        user_id,
-                        15 * 60
-                    )
-
-                except Exception:
-
-                    logger.exception(
-                        "Reminder error for user %s",
-                        user_id
-                    )
-
-                    await asyncio.to_thread(
-                        postpone_reminder,
-                        user_id,
-                        15 * 60
-                    )
-
-                await asyncio.sleep(SEND_DELAY)
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception:
-
-            logger.exception(
-                "Reminder worker cycle failed."
-            )
-
-        await asyncio.sleep(CHECK_INTERVAL)
-
-
-# ============================================================
-# STARTUP AND SHUTDOWN
-# ============================================================
-
-async def post_init(application: Application):
-
-    await asyncio.to_thread(init_db)
-
-    application.bot_data["reminder_task"] = asyncio.create_task(
-        reminder_loop(application),
-        name="promotional-reminder-worker"
+    await show_menu(
+        chat_id=update.effective_chat.id,
+        context=context,
+        user_id=user_id,
     )
 
-    logger.info("Bot startup completed.")
 
+# --------------------------------------------------
+# ADMIN USERS COMMAND
+# --------------------------------------------------
 
-async def post_stop(application: Application):
-
-    task = application.bot_data.pop(
-        "reminder_task",
-        None
-    )
-
-    if task:
-
-        task.cancel()
-
-        with suppress(asyncio.CancelledError):
-            await task
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-
-    if context.error:
-
-        logger.error(
-            "Unhandled bot error",
-            exc_info=(
-                type(context.error),
-                context.error,
-                context.error.__traceback__
-            )
+async def users_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not ADMIN_USER_ID:
+        await update.message.reply_text(
+            "Admin access has not been configured."
         )
+        return
+
+    if str(update.effective_user.id) != ADMIN_USER_ID:
+        await update.message.reply_text(
+            "You are not authorized to use this command."
+        )
+        return
+
+    total = get_total_users()
+
+    await update.message.reply_text(
+        f"Total registered users: {total}"
+    )
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# --------------------------------------------------
+# HELP COMMAND
+# --------------------------------------------------
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    await update.message.reply_text(
+        "BOT MENU\n\n"
+        "REVERSE:\n"
+        "- Logo Maker\n"
+        "- QR Code Generator\n"
+        "- Barcode Generator\n\n"
+        "REDIRECT:\n"
+        "- Promotional message\n"
+        "- Join Channel button\n\n"
+        "Commands:\n"
+        "/start - Open the bot\n"
+        "/home - Show the menu\n"
+        "/cancel - Cancel an active operation\n"
+        "/help - Show this help message"
+    )
+
+
+# --------------------------------------------------
+# ERROR HANDLER
+# --------------------------------------------------
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    error = context.error
+
+    logger.error(
+        "An error occurred while processing an update",
+        exc_info=(
+            type(error),
+            error,
+            error.__traceback__,
+        ) if error else None,
+    )
+
+
+# --------------------------------------------------
+# MAIN APPLICATION
+# --------------------------------------------------
 
 def main():
-
     if not BOT_TOKEN:
-
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing from Render."
+            "Missing TELEGRAM_BOT_TOKEN environment variable."
         )
 
-    if not ADMIN_USER_ID.isdigit():
-
-        raise RuntimeError(
-            "ADMIN_USER_ID must be your numeric Telegram user ID."
-        )
-
-    if not CHANNEL_LINK.startswith("https://t.me/"):
-
-        raise RuntimeError(
-            "CHANNEL_LINK must be a valid Telegram link."
-        )
+    init_database()
 
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_stop(post_stop)
         .build()
     )
 
+    # Commands
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler("start", start_command)
     )
 
     application.add_handler(
-        CommandHandler("help", help_command)
+        CommandHandler("home", home_command)
     )
 
     application.add_handler(
@@ -1286,30 +781,43 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler("stop", stop_command)
+        CommandHandler("help", help_command)
     )
 
     application.add_handler(
         CommandHandler("users", users_command)
     )
 
+    # Mode buttons
     application.add_handler(
-        CallbackQueryHandler(callback_handler)
+        CallbackQueryHandler(
+            mode_callback,
+            pattern=r"^mode:(REVERSE|REDIRECT)$"
+        )
     )
 
+    # Software tool buttons
+    application.add_handler(
+        CallbackQueryHandler(
+            tool_callback,
+            pattern=r"^tool:(logo|qr|barcode)$"
+        )
+    )
+
+    # Text sent after selecting a software tool
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            text_handler
+            handle_tool_input
         )
     )
 
     application.add_error_handler(error_handler)
 
-    logger.info("Starting Telegram bot.")
+    logger.info("Bot is starting...")
 
     application.run_polling(
-        drop_pending_updates=True
+        allowed_updates=Update.ALL_TYPES
     )
 
 
