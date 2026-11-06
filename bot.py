@@ -1,10 +1,8 @@
-
 import os
 import io
-import re
 import sqlite3
 import logging
-from datetime import datetime, timezone
+from pathlib import Path
 
 import qrcode
 import barcode
@@ -15,770 +13,597 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton
 )
-
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
-    filters
+    filters,
 )
 
-
-# =========================================
+# =========================================================
 # CONFIGURATION
-# =========================================
+# =========================================================
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-
-CHANNEL_LINK = os.getenv(
-    "CHANNEL_LINK",
-    "https://t.me/yourchannel"
-).strip()
-
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/yourchannel")
 PROMO_TEXT = os.getenv(
     "PROMO_TEXT",
-    "Welcome! Join our channel to receive updates and announcements."
+    "Welcome! Join our channel to receive updates and information."
 )
 
+WELCOME_IMAGE = os.getenv("WELCOME_IMAGE", "welcome.jpg")
 DB_PATH = os.getenv("DB_PATH", "users.db")
 
-# SOFTWARE = Logo, QR and Barcode tools
-# REDIRECT = Original promotional bot
-
-GLOBAL_BOT_MODE = "SOFTWARE"
-
+MODE_REDIRECT = "REDIRECT"
+MODE_REVERSE = "REVERSE"
 
 logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-
 logger = logging.getLogger(__name__)
 
 
-# =========================================
+# =========================================================
 # DATABASE
-# =========================================
+# =========================================================
 
-def init_db():
+def db_connection():
+    folder = os.path.dirname(DB_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
 
-    with sqlite3.connect(DB_PATH) as conn:
+    return sqlite3.connect(DB_PATH)
 
+
+def initialize_database():
+    with db_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                first_seen TEXT NOT NULL
+                user_id INTEGER PRIMARY KEY
             )
         """)
 
-        conn.commit()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                setting TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            INSERT OR IGNORE INTO settings (setting, value)
+            VALUES ('bot_mode', 'REDIRECT')
+        """)
 
 
 def save_user(user_id):
-
-    with sqlite3.connect(DB_PATH) as conn:
-
+    with db_connection() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO users VALUES (?, ?)",
-            (
-                user_id,
-                datetime.now(timezone.utc).isoformat()
-            )
+            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+            (user_id,),
         )
 
-        conn.commit()
 
-
-def user_count():
-
-    with sqlite3.connect(DB_PATH) as conn:
-
-        return conn.execute(
+def get_user_count():
+    with db_connection() as conn:
+        result = conn.execute(
             "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
+        ).fetchone()
+        return result[0]
 
 
-def is_admin(update):
+def get_mode():
+    with db_connection() as conn:
+        result = conn.execute(
+            "SELECT value FROM settings WHERE setting = 'bot_mode'"
+        ).fetchone()
 
-    return bool(
-        update.effective_user
-        and ADMIN_USER_ID
-        and update.effective_user.id == ADMIN_USER_ID
-    )
-
-
-# =========================================
-# SOFTWARE MENU
-# =========================================
-
-def main_keyboard():
-
-    return ReplyKeyboardMarkup(
-        [
-            [
-                KeyboardButton("Logo Maker"),
-                KeyboardButton("QR Code Generator")
-            ],
-            [
-                KeyboardButton("Barcode Generator"),
-                KeyboardButton("Help")
-            ]
-        ],
-        resize_keyboard=True
-    )
+    return result[0] if result else MODE_REDIRECT
 
 
-# =========================================
-# LOGO GENERATOR
-# =========================================
+def set_mode(mode):
+    with db_connection() as conn:
+        conn.execute("""
+            INSERT INTO settings (setting, value)
+            VALUES ('bot_mode', ?)
+            ON CONFLICT(setting)
+            DO UPDATE SET value = excluded.value
+        """, (mode,))
+
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID and ADMIN_ID != 0
+
+
+# =========================================================
+# IMAGE GENERATORS
+# =========================================================
+
+def load_font(size):
+    possible_fonts = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+
+    for font_path in possible_fonts:
+        if os.path.exists(font_path):
+            return ImageFont.truetype(font_path, size)
+
+    return ImageFont.load_default()
+
 
 def create_logo(text, style):
-
-    palettes = {
-
-        "blue": (
-            (12, 32, 72),
-            (34, 126, 230),
-            (255, 255, 255)
-        ),
-
-        "dark": (
-            (18, 18, 24),
-            (65, 65, 82),
-            (255, 255, 255)
-        ),
-
-        "gold": (
-            (42, 28, 8),
-            (176, 128, 36),
-            (255, 245, 210)
-        ),
-
-        "purple": (
-            (42, 18, 72),
-            (132, 70, 190),
-            (255, 255, 255)
-        ),
-
-        "green": (
-            (10, 54, 43),
-            (28, 145, 105),
-            (255, 255, 255)
-        )
-
+    styles = {
+        "blue": ((20, 55, 110), (40, 150, 220)),
+        "dark": ((15, 15, 20), (65, 65, 75)),
+        "gold": ((75, 50, 10), (205, 155, 55)),
+        "purple": ((55, 25, 95), (150, 85, 200)),
+        "green": ((10, 65, 45), (55, 160, 105)),
     }
 
-    top, bottom, foreground = palettes[style]
+    start, end = styles.get(style, styles["blue"])
 
-    width, height = 1000, 600
-
-    image = Image.new("RGB", (width, height))
-
-    pixels = image.load()
-
-    for y in range(height):
-
-        ratio = y / (height - 1)
-
-        color = tuple(
-            int(
-                top[i] * (1 - ratio)
-                + bottom[i] * ratio
-            )
-            for i in range(3)
-        )
-
-        for x in range(width):
-            pixels[x, y] = color
-
+    image = Image.new("RGB", (1000, 600))
     draw = ImageDraw.Draw(image)
 
-    center_x = width // 2
-    center_y = 210
+    for y in range(600):
+        ratio = y / 600
+        color = tuple(
+            int(start[i] * (1 - ratio) + end[i] * ratio)
+            for i in range(3)
+        )
+        draw.line((0, y, 1000, y), fill=color)
 
-    draw.rounded_rectangle(
-        (
-            center_x - 90,
-            center_y - 90,
-            center_x + 90,
-            center_y + 90
-        ),
-        radius=38,
-        outline=foreground,
-        width=10
-    )
+    font = load_font(65)
+    text = text[:22]
 
-    draw.line(
-        (
-            center_x - 45,
-            center_y + 25,
-            center_x,
-            center_y - 35,
-            center_x + 45,
-            center_y + 25
-        ),
-        fill=foreground,
-        width=14
-    )
-
-    font_path = (
-        "/usr/share/fonts/truetype/"
-        "dejavu/DejaVuSans-Bold.ttf"
-    )
-
-    font_size = 72
-
-    try:
-
-        font = ImageFont.truetype(font_path, font_size)
-
-        while font_size > 28:
-
-            bbox = draw.textbbox((0, 0), text, font=font)
-
-            if bbox[2] <= 850:
-                break
-
-            font_size -= 4
-
-            font = ImageFont.truetype(font_path, font_size)
-
-    except OSError:
-
-        font = ImageFont.load_default()
-
-    bbox = draw.textbbox((0, 0), text, font=font)
-
-    text_width = bbox[2] - bbox[0]
+    box = draw.textbbox((0, 0), text, font=font)
+    text_width = box[2] - box[0]
+    text_height = box[3] - box[1]
 
     draw.text(
-        ((width - text_width) // 2, 410),
+        ((1000 - text_width) / 2, (600 - text_height) / 2),
         text,
+        fill="white",
         font=font,
-        fill=foreground
     )
 
     output = io.BytesIO()
-
-    output.name = "logo.png"
-
-    image.save(output, "PNG")
-
+    image.save(output, format="PNG")
     output.seek(0)
-
     return output
 
 
-# =========================================
-# QR CODE GENERATOR
-# =========================================
-
 def create_qr(data):
-
     qr = qrcode.QRCode(
         version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
         box_size=10,
-        border=4
+        border=4,
     )
-
     qr.add_data(data)
-
     qr.make(fit=True)
 
     image = qr.make_image(
         fill_color="black",
-        back_color="white"
+        back_color="white",
     ).convert("RGB")
 
     output = io.BytesIO()
-
-    output.name = "qr_code.png"
-
-    image.save(output, "PNG")
-
+    image.save(output, format="PNG")
     output.seek(0)
-
     return output
 
-
-# =========================================
-# BARCODE GENERATOR
-# =========================================
 
 def create_barcode(data):
-
-    code = barcode.get(
-        "code128",
-        data,
-        writer=ImageWriter()
-    )
+    code_class = barcode.get_barcode_class("code128")
+    code = code_class(data, writer=ImageWriter())
 
     output = io.BytesIO()
-
-    output.name = "barcode.png"
-
-    code.write(
-        output,
-        options={
-            "module_width": 0.35,
-            "module_height": 18,
-            "quiet_zone": 6,
-            "font_size": 12,
-            "text_distance": 5,
-            "write_text": True
-        }
-    )
-
+    code.write(output)
     output.seek(0)
-
     return output
 
 
-# =========================================
-# REDIRECT MODE: ORIGINAL BOT
-# =========================================
+# =========================================================
+# KEYBOARDS
+# =========================================================
 
-async def redirect_start(update, context):
-
-    keyboard = InlineKeyboardMarkup(
+def admin_mode_buttons():
+    return [
         [
-            [
-                InlineKeyboardButton(
-                    "Join Channel",
-                    url=CHANNEL_LINK
-                )
-            ]
+            InlineKeyboardButton(
+                "REDIRECT",
+                callback_data="mode:REDIRECT",
+            ),
+            InlineKeyboardButton(
+                "REVERSE",
+                callback_data="mode:REVERSE",
+            ),
         ]
+    ]
+
+
+def redirect_keyboard(user_id):
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "Join Channel",
+                url=CHANNEL_LINK,
+            )
+        ]
+    ]
+
+    if is_admin(user_id):
+        keyboard.extend(admin_mode_buttons())
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+def software_keyboard(user_id):
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "Logo Maker",
+                callback_data="tool:logo",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "QR Code Generator",
+                callback_data="tool:qr",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "Barcode Generator",
+                callback_data="tool:barcode",
+            )
+        ],
+    ]
+
+    if is_admin(user_id):
+        keyboard.extend(admin_mode_buttons())
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+def logo_styles_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Blue", callback_data="style:blue"),
+            InlineKeyboardButton("Dark", callback_data="style:dark"),
+        ],
+        [
+            InlineKeyboardButton("Gold", callback_data="style:gold"),
+            InlineKeyboardButton("Purple", callback_data="style:purple"),
+            InlineKeyboardButton("Green", callback_data="style:green"),
+        ],
+    ])
+
+
+# =========================================================
+# WELCOME SCREENS
+# =========================================================
+
+async def show_redirect_screen(message, user_id):
+    keyboard = redirect_keyboard(user_id)
+
+    if os.path.isfile(WELCOME_IMAGE):
+        with open(WELCOME_IMAGE, "rb") as photo:
+            await message.reply_photo(
+                photo=photo,
+                caption=PROMO_TEXT,
+                reply_markup=keyboard,
+            )
+    else:
+        await message.reply_text(
+            PROMO_TEXT,
+            reply_markup=keyboard,
+        )
+
+
+async def show_software_screen(message, user_id):
+    await message.reply_text(
+        "Welcome to the Software Tools Bot.\n\n"
+        "Choose the tool you want to use:",
+        reply_markup=software_keyboard(user_id),
     )
 
-    await update.effective_message.reply_text(
-        PROMO_TEXT,
-        reply_markup=keyboard
-    )
+
+async def show_active_screen(message, user_id):
+    if get_mode() == MODE_REDIRECT:
+        await show_redirect_screen(message, user_id)
+    else:
+        await show_software_screen(message, user_id)
 
 
-# =========================================
-# START COMMAND
-# =========================================
+# =========================================================
+# COMMANDS
+# =========================================================
 
-async def start(update, context):
-
-    if update.effective_user:
-        save_user(update.effective_user.id)
-
-    if GLOBAL_BOT_MODE == "REDIRECT":
-
-        await redirect_start(update, context)
-
-        return
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user.id)
 
     context.user_data.clear()
 
-    await update.effective_message.reply_text(
-        "Welcome! Choose a software tool below:",
-        reply_markup=main_keyboard()
+    await show_active_screen(
+        update.effective_message,
+        user.id,
     )
 
 
-# =========================================
-# HELP COMMAND
-# =========================================
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
 
-async def help_command(update, context):
-
-    if GLOBAL_BOT_MODE == "REDIRECT":
-        return
-
-    text = (
-        "Available Software Tools:\n\n"
-        "Logo Maker - Create text-based logos.\n\n"
-        "QR Code Generator - Generate QR codes.\n\n"
-        "Barcode Generator - Generate Code 128 barcodes.\n\n"
-        "Use /cancel to cancel an operation."
-    )
-
-    if is_admin(update):
-
-        text += "\n\nAdmin command: /users"
-
-    await update.effective_message.reply_text(
-        text,
-        reply_markup=main_keyboard()
-    )
-
-
-# =========================================
-# USERS COMMAND
-# =========================================
-
-async def users_command(update, context):
-
-    if GLOBAL_BOT_MODE == "REDIRECT":
-        return
-
-    if not is_admin(update):
+    if get_mode() == MODE_REDIRECT:
+        await show_redirect_screen(
+            update.effective_message,
+            user_id,
+        )
         return
 
     await update.effective_message.reply_text(
-        f"Registered users: {user_count()}"
+        "Choose a tool from the menu to get started.\n\n"
+        "Use /start to return to the main menu.\n"
+        "Use /cancel to cancel your current task."
     )
 
 
-# =========================================
-# CANCEL COMMAND
-# =========================================
-
-async def cancel_command(update, context):
-
-    if GLOBAL_BOT_MODE == "REDIRECT":
-        return
-
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await update.effective_message.reply_text(
-        "Operation cancelled.",
-        reply_markup=main_keyboard()
+        "Your current task has been cancelled."
+    )
+
+    await show_active_screen(
+        update.effective_message,
+        update.effective_user.id,
     )
 
 
-# =========================================
-# MAIN TEXT HANDLER
-# =========================================
-
-async def handle_text(update, context):
-
-    global GLOBAL_BOT_MODE
-
-    message = update.effective_message
-
-    if not message or not message.text:
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
 
-    text = message.text.strip()
+    await update.effective_message.reply_text(
+        f"Total registered users: {get_user_count()}\n"
+        f"Active mode: {get_mode()}"
+    )
 
-    # =====================================
-    # ADMIN MODE SWITCHING
-    # =====================================
 
-    if is_admin(update):
+# =========================================================
+# MODE SWITCHING
+# =========================================================
 
-        if text == "REDIRECT":
-
-            GLOBAL_BOT_MODE = "REDIRECT"
-
-            context.user_data.clear()
-
-            await message.reply_text(
-                "Original promotional bot mode activated."
-            )
-
-            return
-
-        if text == "REVERSE":
-
-            GLOBAL_BOT_MODE = "SOFTWARE"
-
-            context.user_data.clear()
-
-            await message.reply_text(
-                "Software mode activated. "
-                "Logo Maker, QR Code Generator and Barcode Generator are now available.",
-                reply_markup=main_keyboard()
-            )
-
-            return
-
-    # =====================================
-    # REDIRECT MODE
-    # =====================================
-
-    if GLOBAL_BOT_MODE == "REDIRECT":
-        return
-
-    # =====================================
-    # HELP BUTTON
-    # =====================================
-
-    if text == "Help":
-
-        await help_command(update, context)
-
-        return
-
-    # =====================================
-    # TOOL SELECTION
-    # =====================================
-
-    tools = {
-
-        "Logo Maker": "logo",
-
-        "QR Code Generator": "qr",
-
-        "Barcode Generator": "barcode"
-
-    }
-
-    if text in tools:
-
-        tool = tools[text]
-
-        context.user_data["tool"] = tool
-
-        context.user_data["step"] = "input"
-
-        prompts = {
-
-            "logo": "Send the text for your logo. Maximum 80 characters.",
-
-            "qr": "Send the text or website URL for your QR code.",
-
-            "barcode": "Send the letters or numbers for your barcode."
-
-        }
-
-        await message.reply_text(prompts[tool])
-
-        return
-
-    # =====================================
-    # CHECK INPUT
-    # =====================================
-
-    if context.user_data.get("step") != "input":
-
-        await message.reply_text(
-            "Please select a tool from the menu.",
-            reply_markup=main_keyboard()
-        )
-
-        return
-
-    tool = context.user_data.get("tool")
-
-    try:
-
-        # LOGO
-
-        if tool == "logo":
-
-            if len(text) > 80:
-
-                await message.reply_text(
-                    "Maximum logo text length is 80 characters."
-                )
-
-                return
-
-            context.user_data["pending_text"] = text
-
-            context.user_data["step"] = "style"
-
-            buttons = [
-
-                [
-                    InlineKeyboardButton("Blue", callback_data="style:blue"),
-                    InlineKeyboardButton("Dark", callback_data="style:dark")
-                ],
-
-                [
-                    InlineKeyboardButton("Gold", callback_data="style:gold"),
-                    InlineKeyboardButton("Purple", callback_data="style:purple")
-                ],
-
-                [
-                    InlineKeyboardButton("Green", callback_data="style:green")
-                ]
-
-            ]
-
-            await message.reply_text(
-                "Choose your logo color:",
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-
-            return
-
-        # QR CODE
-
-        elif tool == "qr":
-
-            if len(text) > 2000:
-
-                await message.reply_text(
-                    "QR content must be under 2,000 characters."
-                )
-
-                return
-
-            await message.reply_photo(
-                photo=create_qr(text),
-                caption="Your QR code is ready."
-            )
-
-        # BARCODE
-
-        elif tool == "barcode":
-
-            if (
-                len(text) > 80
-                or not re.fullmatch(r"[ -~]+", text)
-            ):
-
-                await message.reply_text(
-                    "Use up to 80 standard letters, numbers or basic symbols."
-                )
-
-                return
-
-            await message.reply_photo(
-                photo=create_barcode(text),
-                caption="Your barcode is ready."
-            )
-
-    except Exception:
-
-        logger.exception("Generation error")
-
-        await message.reply_text(
-            "Unable to generate your image. Please try again."
-        )
-
-    finally:
-
-        if tool in ("qr", "barcode"):
-            context.user_data.clear()
-
-
-# =========================================
-# LOGO STYLE CALLBACK
-# =========================================
-
-async def style_callback(update, context):
-
+async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = query.from_user.id
+
+    if not is_admin(user_id):
+        await query.answer(
+            "You are not authorized to change the bot mode.",
+            show_alert=True,
+        )
+        return
+
+    selected_mode = query.data.split(":", 1)[1]
+
+    if selected_mode not in (MODE_REDIRECT, MODE_REVERSE):
+        await query.answer("Invalid mode.")
+        return
+
+    set_mode(selected_mode)
+    context.user_data.clear()
+
+    await query.answer(f"{selected_mode} mode activated.")
+
+    # Refresh the admin's screen immediately.
+    await query.message.delete()
+
+    await show_active_screen(
+        query.message,
+        user_id,
+    )
+
+
+# =========================================================
+# SOFTWARE TOOL BUTTONS
+# =========================================================
+
+async def tool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
 
     await query.answer()
 
-    if GLOBAL_BOT_MODE == "REDIRECT":
+    # Check the current global mode every time a button is pressed.
+    if get_mode() != MODE_REVERSE:
+        await query.message.reply_text(
+            "The software tools are currently unavailable."
+        )
+        await show_active_screen(query.message, user_id)
+        return
+
+    tool = query.data.split(":", 1)[1]
+
+    if tool == "logo":
+        context.user_data["waiting_for"] = "logo"
+        await query.message.reply_text(
+            "Send the text you want to use for your logo."
+        )
+
+    elif tool == "qr":
+        context.user_data["waiting_for"] = "qr"
+        await query.message.reply_text(
+            "Send the text or URL you want to convert into a QR code."
+        )
+
+    elif tool == "barcode":
+        context.user_data["waiting_for"] = "barcode"
+        await query.message.reply_text(
+            "Send the numbers or text you want to convert into a barcode."
+        )
+
+
+async def style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if get_mode() != MODE_REVERSE:
+        await query.message.reply_text(
+            "The software tools are currently unavailable."
+        )
+        return
+
+    if context.user_data.get("waiting_for") != "logo_style":
         return
 
     style = query.data.split(":", 1)[1]
+    logo_text = context.user_data.get("logo_text", "My Logo")
 
-    text = context.user_data.get("pending_text")
-
-    if not text:
-
-        await query.edit_message_text(
-            "Request expired. Please start again."
-        )
-
-        return
-
-    try:
-
-        await query.message.reply_photo(
-            photo=create_logo(text, style),
-            caption="Your logo is ready."
-        )
-
-        await query.edit_message_text(
-            "Logo generated successfully."
-        )
-
-    except Exception:
-
-        logger.exception("Logo generation error")
-
-        await query.edit_message_text(
-            "Unable to generate your logo."
-        )
+    image = create_logo(logo_text, style)
 
     context.user_data.clear()
 
-
-# =========================================
-# INITIALIZATION
-# =========================================
-
-async def post_init(application):
-
-    init_db()
-
-    logger.info(
-        "Bot started in %s mode",
-        GLOBAL_BOT_MODE
+    await query.message.reply_photo(
+        photo=image,
+        caption="Your logo is ready.",
     )
 
 
-# =========================================
-# MAIN
-# =========================================
+# =========================================================
+# TEXT INPUT
+# =========================================================
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.effective_message.text.strip()
+
+    # In REDIRECT mode, users only receive the promotional function.
+    if get_mode() == MODE_REDIRECT:
+        context.user_data.clear()
+
+        await show_redirect_screen(
+            update.effective_message,
+            user_id,
+        )
+        return
+
+    waiting_for = context.user_data.get("waiting_for")
+
+    if not waiting_for:
+        await update.effective_message.reply_text(
+            "Please choose a tool from the menu.",
+            reply_markup=software_keyboard(user_id),
+        )
+        return
+
+    if waiting_for == "logo":
+        context.user_data["logo_text"] = text[:22]
+        context.user_data["waiting_for"] = "logo_style"
+
+        await update.effective_message.reply_text(
+            "Choose a logo style:",
+            reply_markup=logo_styles_keyboard(),
+        )
+
+    elif waiting_for == "qr":
+        try:
+            image = create_qr(text)
+            context.user_data.clear()
+
+            await update.effective_message.reply_photo(
+                photo=image,
+                caption="Your QR code is ready.",
+            )
+        except Exception:
+            logger.exception("QR generation failed")
+            await update.effective_message.reply_text(
+                "I could not generate that QR code. Please try again."
+            )
+
+    elif waiting_for == "barcode":
+        try:
+            image = create_barcode(text)
+            context.user_data.clear()
+
+            await update.effective_message.reply_photo(
+                photo=image,
+                caption="Your barcode is ready.",
+            )
+        except Exception:
+            logger.exception("Barcode generation failed")
+            await update.effective_message.reply_text(
+                "I could not generate that barcode. Please try another value."
+            )
+
+
+# =========================================================
+# ERROR HANDLER
+# =========================================================
+
+async def error_handler(update, context):
+    logger.exception(
+        "An error occurred while processing an update:",
+        exc_info=context.error,
+    )
+
+
+# =========================================================
+# START BOT
+# =========================================================
 
 def main():
-
     if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
 
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing."
-        )
+    if ADMIN_ID == 0:
+        raise RuntimeError("ADMIN_USER_ID is missing or invalid.")
 
-    if not ADMIN_USER_ID:
-
-        logger.warning(
-            "ADMIN_USER_ID is missing."
-        )
+    initialize_database()
 
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
         .build()
     )
 
-    application.add_handler(
-        CommandHandler("start", start)
-    )
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("users", users_command))
 
     application.add_handler(
-        CommandHandler("help", help_command)
+        CallbackQueryHandler(mode_callback, pattern=r"^mode:")
     )
-
     application.add_handler(
-        CommandHandler("cancel", cancel_command)
+        CallbackQueryHandler(tool_callback, pattern=r"^tool:")
     )
-
     application.add_handler(
-        CommandHandler("users", users_command)
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            style_callback,
-            pattern=r"^style:"
-        )
+        CallbackQueryHandler(style_callback, pattern=r"^style:")
     )
 
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            handle_text
+            handle_text,
         )
     )
 
-    application.run_polling(
-        drop_pending_updates=True
-    )
+    application.add_error_handler(error_handler)
+
+    logger.info("Bot is starting. Current mode: %s", get_mode())
+
+    application.run_polling()
 
 
 if __name__ == "__main__":
-
     main()
